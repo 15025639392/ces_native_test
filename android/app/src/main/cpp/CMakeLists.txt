@@ -2,7 +2,15 @@ cmake_minimum_required(VERSION 3.22.1)
 
 project(cesium_native_android_poc LANGUAGES CXX)
 
-add_library(cesium_bridge SHARED cesium_bridge.cpp)
+add_library(
+    cesium_bridge
+    SHARED
+        cesium_bridge.cpp
+        batch_renderer.cpp
+        gl_resources.cpp
+        imagery.cpp
+        prepare_renderer_resources.cpp
+)
 
 target_compile_features(cesium_bridge PRIVATE cxx_std_17)
 
