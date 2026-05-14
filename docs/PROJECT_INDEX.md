@@ -4,15 +4,15 @@ Default entry point for AI sessions. Read this first, then only the latest entri
 
 ## What This Is
 
-Android-first Flutter PoC for validating the native rendering shell before adding Cesium Native.
+Android-first Flutter PoC for validating a Cesium Native rendering stack behind a Flutter shell.
 
 Current implementation:
 
-- Flutter app embeds Android `PlatformView`.
-- Kotlin `NativeMapRenderer` boundary isolates renderer/cache ownership.
-- `GaodeCanvasTileRenderer` loads and draws Gaode satellite XYZ tiles.
+- Flutter adapter package embeds Android `PlatformView`.
+- Kotlin `TextureView` hosts an EGL render thread for the native globe surface.
 - Android app builds a C++ `cesium_bridge` JNI library.
 - The bridge directly links a real Android arm64 Cesium Native build through `-PcesiumNativeRoot=/absolute/path`.
+- The bridge now owns tile selection, GPU resource preparation, and frame rendering on the main path.
 - Flutter sends camera/cache commands to native via `MethodChannel`.
 - Native sends fps/draw/tile/cache stats back to Flutter.
 - Android build targets `arm64-v8a`.
@@ -21,32 +21,59 @@ Current implementation:
 
 - Normal continuation: read top 1-3 entries of `docs/SESSION_LOG.md`, then inspect task-related files. This is the default; the user should not need to repeat it.
 - Architecture questions: read `docs/AI_HANDOFF.md`.
+- Ideal target architecture: read `docs/ARCHITECTURE_IDEAL.md`.
+- Migration path to target architecture: read `docs/ARCHITECTURE_MIGRATION.md`.
+- SDK target blueprint: read `docs/SDK_BLUEPRINT.md`.
+- SDK API draft: read `docs/SDK_API_DRAFT.md`.
+- SDK API V1 contract: read `docs/SDK_API_V1.md`.
+- Android SDK direct integration: read `docs/SDK_ANDROID_QUICKSTART.md`.
 - Multi-session rules: read `docs/HANDOFF_PROTOCOL.md`.
 
 ## Key Files
 
-- `lib/main.dart`: Flutter UI, `AndroidView`, channel calls, stats display.
-- `android/app/src/main/kotlin/com/example/cesiumpoc/cesium_native_android_poc/MainActivity.kt`: PlatformView registration.
-- `android/app/src/main/kotlin/com/example/cesiumpoc/cesium_native_android_poc/GaodeSatelliteViewFactory.kt`: PlatformView factory.
-- `android/app/src/main/kotlin/com/example/cesiumpoc/cesium_native_android_poc/GaodeSatellitePlatformView.kt`: PlatformView, frame loop, stats, renderer/bridge coordination.
-- `android/app/src/main/kotlin/com/example/cesiumpoc/cesium_native_android_poc/NativeMapRenderer.kt`: renderer interface plus camera/render stats contracts.
-- `android/app/src/main/kotlin/com/example/cesiumpoc/cesium_native_android_poc/GaodeCanvasTileRenderer.kt`: Gaode tile loading, memory cache, Canvas draw, renderer dispose.
-- `android/app/src/main/kotlin/com/example/cesiumpoc/cesium_native_android_poc/NativeCesiumBridge.kt`: JNI owner for the native bridge.
-- `android/app/src/main/cpp/CMakeLists.txt`: native build and optional Cesium Native package link.
-- `android/app/src/main/cpp/cesium_bridge.cpp`: JNI bridge and camera/cache lifecycle probe.
-- `android/app/build.gradle.kts`: Android config and `arm64-v8a` ABI filter.
-- `android/app/src/main/AndroidManifest.xml`: internet permission and app entry.
+- `examples/flutter-demo/lib/main.dart`: Flutter demo UI, `AndroidView`, channel calls, stats display.
+- `sdk/flutter-plugin/lib/cesium_map_sdk.dart`: Flutter SDK package export surface.
+- `sdk/flutter-plugin/lib/src/cesium_map_widget.dart`: `CesiumMapWidget`, per-view channel binding, Android-only PlatformView adapter.
+- `sdk/flutter-plugin/lib/src/cesium_map_controller.dart`: Flutter controller abstraction and method-channel implementation.
+- `sdk/flutter-plugin/android/src/main/kotlin/com/example/cesiumpoc/cesium_map_sdk/CesiumMapSdkPlugin.kt`: Flutter Android plugin entry, automatic PlatformView registration.
+- `examples/flutter-demo/android/app/src/main/kotlin/com/example/cesiumpoc/cesium_native_android_poc/MainActivity.kt`: demo Android host activity.
+- `examples/android-native-demo/app/src/main/kotlin/com/example/cesiumpoc/native_demo/MainActivity.kt`: native Android demo launcher page.
+- `examples/android-native-demo/app/src/main/kotlin/com/example/cesiumpoc/native_demo/NativeSdkMapActivity.kt`: direct `CesiumMapView` demo page.
+- `examples/android-native-demo/app/src/main/kotlin/com/example/cesiumpoc/native_demo/NativeSdkFragmentActivity.kt`: direct `CesiumMapFragment` demo page.
+- `sdk/android-sdk/src/main/kotlin/com/example/cesiumpoc/cesium_native_android_poc/CesiumMapView.kt`: Android SDK public map host view.
+- `sdk/android-sdk/src/main/kotlin/com/example/cesiumpoc/cesium_native_android_poc/CesiumMapFragment.kt`: Android SDK public fragment host entry.
+- `sdk/android-sdk/src/main/kotlin/com/example/cesiumpoc/cesium_native_android_poc/CesiumMapController.kt`: Android SDK public controller contract.
+- `sdk/android-sdk/src/main/kotlin/com/example/cesiumpoc/cesium_native_android_poc/CesiumMapFragmentController.kt`: fragment-to-controller adapter.
+- `sdk/android-sdk/src/main/kotlin/com/example/cesiumpoc/cesium_native_android_poc/CesiumCameraState.kt`: Android SDK public camera contract.
+- `sdk/android-sdk/src/main/kotlin/com/example/cesiumpoc/cesium_native_android_poc/CesiumMapListener.kt`: Android SDK public event listener contract.
+- `sdk/android-sdk/src/main/kotlin/com/example/cesiumpoc/cesium_native_android_poc/CesiumMapError.kt`: Android SDK public error contract.
+- `sdk/android-sdk/src/main/kotlin/com/example/cesiumpoc/cesium_native_android_poc/CesiumRenderStats.kt`: Android SDK public render stats contract.
+- `sdk/flutter-plugin/android/src/main/kotlin/com/example/cesiumpoc/cesium_map_sdk/internal/flutter/CesiumMapViewFactory.kt`: Flutter-only PlatformView factory.
+- `sdk/flutter-plugin/android/src/main/kotlin/com/example/cesiumpoc/cesium_map_sdk/internal/flutter/CesiumMapPlatformView.kt`: Flutter-only PlatformView adapter.
+- `sdk/android-sdk/src/main/kotlin/com/example/cesiumpoc/cesium_native_android_poc/internal/render/CesiumMapRenderSurface.kt`: `TextureView`, EGL render thread, stats, and bridge coordination.
+- `sdk/android-sdk/src/main/kotlin/com/example/cesiumpoc/cesium_native_android_poc/internal/render/NativeCesiumBridge.kt`: JNI owner for the native bridge source file.
+- `sdk/native-core/src/main/cpp/CMakeLists.txt`: native build and optional Cesium Native package link.
+- `sdk/native-core/src/main/cpp/cesium_bridge.cpp`: JNI bridge, Cesium tileset lifecycle, selection, resource prep, and OpenGL draw path.
+- `examples/flutter-demo/android/app/build.gradle.kts`: demo Android shell config and `arm64-v8a` ABI filter.
+- `examples/flutter-demo/android/app/src/main/AndroidManifest.xml`: demo app entry and internet permission.
 
 ## Commands
 
 ```sh
+cd sdk/android-sdk
+./gradlew assemble
+
+cd sdk/flutter-plugin
+flutter analyze
+
+cd /Users/ldy/Desktop/work/cesium_native_android_poc/examples/flutter-demo
 flutter analyze
 flutter build apk --debug --target-platform android-arm64
 ```
 
 ## Current Big Caveat
 
-The renderer boundary and C++/JNI bridge exist, and the bridge now directly links Cesium Native. The visible imagery still renders through the Kotlin Canvas probe.
+The docs and code were briefly out of sync during the transition from the early Canvas probe to the native EGL/Cesium path. Trust the current code: the runtime renderer path is the native `cesium_bridge`.
 
 ## Code Style Rule
 

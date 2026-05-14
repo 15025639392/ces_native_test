@@ -1,0 +1,22 @@
+name: cesium_map_sdk
+description: Flutter adapter for the Cesium Native Android SDK workspace.
+version: 0.1.0
+publish_to: "none"
+
+environment:
+  sdk: ^3.11.5
+  flutter: ">=3.35.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: com.example.cesiumpoc.cesium_map_sdk
+        pluginClass: CesiumMapSdkPlugin
