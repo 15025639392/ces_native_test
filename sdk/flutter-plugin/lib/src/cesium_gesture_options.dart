@@ -3,8 +3,8 @@ class CesiumGestureOptions {
     this.panEnabled = true,
     this.zoomEnabled = true,
     this.rotateEnabled = false,
-    this.tiltEnabled = false,
-    this.inertiaEnabled = false,
+    this.tiltEnabled = true,
+    this.inertiaEnabled = true,
   });
 
   final bool panEnabled;
@@ -26,8 +26,8 @@ class CesiumGestureOptions {
       panEnabled: map['panEnabled'] as bool? ?? true,
       zoomEnabled: map['zoomEnabled'] as bool? ?? true,
       rotateEnabled: map['rotateEnabled'] as bool? ?? false,
-      tiltEnabled: map['tiltEnabled'] as bool? ?? false,
-      inertiaEnabled: map['inertiaEnabled'] as bool? ?? false,
+      tiltEnabled: map['tiltEnabled'] as bool? ?? true,
+      inertiaEnabled: map['inertiaEnabled'] as bool? ?? true,
     );
   }
 }

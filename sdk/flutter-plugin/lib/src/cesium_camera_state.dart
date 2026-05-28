@@ -2,7 +2,7 @@ class CesiumCameraState {
   const CesiumCameraState({
     required this.longitude,
     required this.latitude,
-    required this.zoom,
+    required this.altitudeMeters,
     required this.autoOrbit,
     this.bearing = 0,
     this.pitch = 0,
@@ -10,7 +10,7 @@ class CesiumCameraState {
 
   final double longitude;
   final double latitude;
-  final double zoom;
+  final double altitudeMeters;
   final bool autoOrbit;
   final double bearing;
   final double pitch;
@@ -18,7 +18,7 @@ class CesiumCameraState {
   Map<String, Object?> toMap() => {
     'longitude': longitude,
     'latitude': latitude,
-    'zoom': zoom,
+    'altitudeMeters': altitudeMeters,
     'autoOrbit': autoOrbit,
     'bearing': bearing,
     'pitch': pitch,
@@ -30,7 +30,7 @@ class CesiumCameraState {
     return CesiumCameraState(
       longitude: asDouble('longitude'),
       latitude: asDouble('latitude'),
-      zoom: asDouble('zoom'),
+      altitudeMeters: asDouble('altitudeMeters'),
       autoOrbit: map['autoOrbit'] as bool? ?? false,
       bearing: asDouble('bearing'),
       pitch: asDouble('pitch'),

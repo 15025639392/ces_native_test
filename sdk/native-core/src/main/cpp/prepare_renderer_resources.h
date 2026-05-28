@@ -10,7 +10,11 @@
 #include <CesiumGltf/Model.h>
 #include <CesiumRasterOverlays/RasterOverlayTile.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <vector>
 
 namespace cesium_poc {
 
@@ -18,6 +22,8 @@ class MinimalPrepareRendererResources final
     : public Cesium3DTilesSelection::IPrepareRendererResources {
 public:
     struct Marker {};
+
+    ~MinimalPrepareRendererResources() override;
 
     CesiumAsync::Future<Cesium3DTilesSelection::TileLoadResultAndRenderResources>
     prepareInLoadThread(
@@ -64,18 +70,34 @@ public:
 
     static bool isGpuResource(const void* resource);
 
-private:
-    static bool isLoadThreadResource(void* resource);
+    void prioritizeVisibleResources(const std::vector<const GpuTileResources*>& visibleResources);
+    size_t processPendingGeometryUploads(size_t maxPrimitives);
+    size_t processPendingRasterUploads(size_t maxTextures);
+    size_t pendingGeometryUploads() const;
+    size_t pendingRasterUploads() const;
 
-    static std::unique_ptr<LoadTileResources> prepareTileImageInLoadThread(
-        const Cesium3DTilesSelection::TileLoadResult& tileLoadResult);
+private:
+    struct ReusableTexture {
+        GLuint id = 0;
+        int32_t width = 0;
+        int32_t height = 0;
+        size_t bytes = 0;
+    };
+
+    struct RasterAtlas {
+        std::shared_ptr<GpuTexture> textureResource;
+        int32_t width = 4096;
+        int32_t height = 4096;
+        int32_t cursorX = 0;
+        int32_t cursorY = 0;
+        int32_t rowHeight = 0;
+    };
 
     static void appendPrimitive(
         const CesiumGltf::Model& model,
         const CesiumGltf::MeshPrimitive& primitive,
         const glm::dmat4& transform,
         const Cesium3DTilesSelection::Tile& tile,
-        const LoadTileResources* loadResources,
         GpuTileResources& resources);
 
     static std::vector<uint32_t> readIndices(
@@ -86,9 +108,29 @@ private:
         const std::vector<uint32_t>& data,
         GpuPrimitive& gpu);
 
-    static std::shared_ptr<GpuTexture> acquireImageTexture(const ImageryTileResource& imagery);
+    static void uploadPrimitiveBuffers(GpuPrimitive& gpu);
 
-    static std::shared_ptr<GpuTexture> createFallbackTexture(const Cesium3DTilesSelection::Tile& tile);
+    void queueGeometryUpload(GpuTileResources* resources);
+    void removeGeometryUpload(GpuTileResources* resources) noexcept;
+    void removePendingRasterAttachments(GpuTileResources* resources) noexcept;
+    void queueRasterUpload(void* resource);
+    void removeRasterUpload(void* resource) noexcept;
+    bool uploadRasterToAtlas(
+        int32_t width,
+        int32_t height,
+        const std::vector<std::byte>& pixelData,
+        std::shared_ptr<GpuTexture>& textureResource,
+        glm::dvec2& atlasTranslation,
+        glm::dvec2& atlasScale);
+    GLuint acquireReusableTexture(int32_t width, int32_t height);
+    void cacheReusableTexture(GLuint texture, int32_t width, int32_t height, size_t bytes) noexcept;
+
+    mutable std::mutex _uploadMutex;
+    std::vector<GpuTileResources*> _pendingGeometryUploads;
+    std::vector<void*> _pendingRasterUploads;
+    std::vector<ReusableTexture> _reusableTextures;
+    std::vector<RasterAtlas> _rasterAtlases;
+    uint64_t _uploadPriorityCounter = 0;
 };
 
 } // namespace cesium_poc

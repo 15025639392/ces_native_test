@@ -15,14 +15,14 @@ import android.view.TextureView
 import android.view.ViewConfiguration
 import com.example.cesiumpoc.cesium_native_android_poc.CesiumCameraState
 import com.example.cesiumpoc.cesium_native_android_poc.CesiumGestureOptions
+import com.example.cesiumpoc.cesium_native_android_poc.ImagerySource
 import com.example.cesiumpoc.cesium_native_android_poc.CesiumPerformanceOptions
 import com.example.cesiumpoc.cesium_native_android_poc.CesiumRenderStats
 import com.example.cesiumpoc.cesium_native_android_poc.NativeCesiumBridge
+import com.example.cesiumpoc.cesium_native_android_poc.UrlTemplateImagerySource
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import kotlin.math.atan2
-import kotlin.math.cos
-import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.pow
 
@@ -44,9 +44,14 @@ internal class CesiumMapRenderSurface(
     private val backgroundPollIntervalNanos = 250_000_000L
     private val minFlingVelocity = ViewConfiguration.get(context).scaledMinimumFlingVelocity.toDouble()
     private val cameraChangedThrottleMs = 33L
-    private val cameraIdleDelayMs = 140L
-    private val panSensitivity = 0.85
-    private val doubleTapZoomDelta = 1.0
+    private val cameraIdleDelayMs = 280L
+    private val panSensitivity = 0.68
+    private val doubleTapAltitudeScale = 0.58
+    private val rotateSensitivity = 0.55
+    private val tiltSensitivity = 0.06
+    private val minGesturePanDistancePx = 0.75
+    private val minRotateDeltaDegrees = 0.18
+    private val minTiltDeltaDegrees = 0.12
     private val scaleGestureDetector =
         ScaleGestureDetector(
             context,
@@ -91,14 +96,20 @@ internal class CesiumMapRenderSurface(
                     ) {
                         return false
                     }
-                    applyPan(distanceX.toDouble(), distanceY.toDouble(), CameraChangeSource.GESTURE)
+                    applyPan(
+                        currentX = e2.x.toDouble(),
+                        currentY = e2.y.toDouble(),
+                        distanceX = distanceX.toDouble(),
+                        distanceY = distanceY.toDouble(),
+                        source = CameraChangeSource.GESTURE,
+                    )
                     return true
                 }
 
                 override fun onDoubleTap(e: MotionEvent): Boolean {
                     if (!interactionEnabled || !gestureOptions.zoomEnabled) return false
                     stopInertia()
-                    applyZoomDelta(doubleTapZoomDelta, e.x.toDouble(), e.y.toDouble())
+                    applyZoomDelta(1.0, e.x.toDouble(), e.y.toDouble())
                     return true
                 }
 
@@ -120,17 +131,17 @@ internal class CesiumMapRenderSurface(
         )
 
     @Volatile
-    private var longitude: Double = 116.397389
+    private var longitude: Double = 104.0
     @Volatile
-    private var latitude: Double = 39.908722
+    private var latitude: Double = 35.0
     @Volatile
-    private var zoom: Double = 15.0
+    private var altitudeMeters: Double = 3_535_534.0
     @Volatile
     private var autoOrbit: Boolean = false
     @Volatile
     private var bearing: Double = 0.0
     @Volatile
-    private var pitch: Double = 0.0
+    private var pitch: Double = 35.0
 
     var interactionEnabled: Boolean = true
         set(value) {
@@ -144,6 +155,11 @@ internal class CesiumMapRenderSurface(
         set(value) {
             field = value
             applyEffectiveMaximumScreenSpaceError()
+        }
+    var imagerySource: ImagerySource? = null
+        set(value) {
+            field = value
+            applyImagerySource(force = true)
         }
 
     var onStats: ((CesiumRenderStats) -> Unit)? = null
@@ -178,6 +194,8 @@ internal class CesiumMapRenderSurface(
     private var multiTouchTracking = false
     private var lastMultiTouchAngleDegrees = 0.0
     private var lastMultiTouchFocusY = 0.0
+    private var lastMultiTouchFirstY = 0.0
+    private var lastMultiTouchSecondY = 0.0
     private val cameraChangedRunnable =
         Runnable {
             pendingCameraChanged?.let(::dispatchCameraChangedNow)
@@ -185,6 +203,7 @@ internal class CesiumMapRenderSurface(
     private val cameraIdleRunnable =
         Runnable {
             isCameraMoving = false
+            cesiumBridge.setCameraMoving(false)
             applyEffectiveMaximumScreenSpaceError()
             onCameraIdle?.invoke(cameraState)
         }
@@ -198,11 +217,17 @@ internal class CesiumMapRenderSurface(
                 val now = System.nanoTime()
                 val dt = if (inertiaLastFrameNanos == 0L) 0.016 else (now - inertiaLastFrameNanos) / 1_000_000_000.0
                 inertiaLastFrameNanos = now
-                applyPan(-inertiaVelocityX * dt, -inertiaVelocityY * dt, CameraChangeSource.INERTIA)
-                val decay = 0.90.pow(dt / 0.016)
+                applyPan(
+                    currentX = widthPx * 0.5,
+                    currentY = heightPx * 0.5,
+                    distanceX = -inertiaVelocityX * dt,
+                    distanceY = -inertiaVelocityY * dt,
+                    source = CameraChangeSource.INERTIA,
+                )
+                val decay = 0.84.pow(dt / 0.016)
                 inertiaVelocityX *= decay
                 inertiaVelocityY *= decay
-                if (max(abs(inertiaVelocityX), abs(inertiaVelocityY)) < 8.0) {
+                if (max(abs(inertiaVelocityX), abs(inertiaVelocityY)) < 18.0) {
                     inertiaRunning = false
                     scheduleCameraIdle()
                     return
@@ -218,7 +243,7 @@ internal class CesiumMapRenderSurface(
     }
 
     val cameraState: CesiumCameraState
-        get() = CesiumCameraState(longitude, latitude, zoom, autoOrbit, bearing, pitch)
+        get() = CesiumCameraState(longitude, latitude, altitudeMeters, autoOrbit, bearing, pitch)
 
     fun setCamera(camera: CesiumCameraState) {
         applyCamera(camera, CameraChangeSource.PROGRAMMATIC)
@@ -259,14 +284,17 @@ internal class CesiumMapRenderSurface(
                 cesiumBridge.onSurfaceCreated()
                 cesiumBridge.onSurfaceChanged(widthPx, heightPx)
                 applyEffectiveMaximumScreenSpaceError(force = true)
+                applyImagerySource(force = true)
                 val camera = cameraState
-                cesiumBridge.updateCamera(
-                    camera.longitude,
-                    camera.latitude,
-                    camera.zoom,
-                    camera.autoOrbit,
-                    camera.bearing,
-                    camera.pitch,
+                syncLocalCamera(
+                    cesiumBridge.updateCamera(
+                        camera.longitude,
+                        camera.latitude,
+                        camera.altitudeMeters,
+                        camera.autoOrbit,
+                        camera.bearing,
+                        camera.pitch,
+                    ),
                 )
                 if (readyEmitted.compareAndSet(false, true)) {
                     mainHandler.post { onMapReady?.invoke() }
@@ -389,8 +417,8 @@ internal class CesiumMapRenderSurface(
         if (autoOrbit) {
             if (lastOrbitNanos != 0L) {
                 val orbitDt = (now - lastOrbitNanos) / 1_000_000_000.0
-                applyCamera(
-                    cameraState.copy(longitude = wrapLongitude(longitude + orbitDt * 0.015)),
+                adoptNativeCamera(
+                    cesiumBridge.orbitCamera(orbitDt, 0.015),
                     CameraChangeSource.AUTO_ORBIT,
                 )
             }
@@ -418,29 +446,39 @@ internal class CesiumMapRenderSurface(
         mainHandler.post { onStats?.invoke(snapshotStats()) }
     }
 
+    private fun applyImagerySource(force: Boolean = false) {
+        if (!force && imagerySource == null) return
+        val urlTemplate = (imagerySource as? UrlTemplateImagerySource)?.urlTemplate
+        cesiumBridge.setImageryUrlTemplate(urlTemplate)
+    }
+
     private fun emitError(code: String, message: String, details: String? = null) {
         mainHandler.post { onError?.invoke(code, message, details) }
     }
 
     private fun applyPan(
+        currentX: Double,
+        currentY: Double,
         distanceX: Double,
         distanceY: Double,
         source: CameraChangeSource,
     ) {
         if (!gestureOptions.panEnabled) return
-        val metersPerPixel = metersPerPixel(latitude, zoom)
-        val eastMeters = distanceX * metersPerPixel * panSensitivity
-        val northMeters = -distanceY * metersPerPixel * panSensitivity
-        val nextCamera =
-            shiftCameraByMeters(cameraState, eastMeters, northMeters).copy(
-                autoOrbit = false,
-            )
-        applyCamera(nextCamera, source)
+        val pixelDistance = kotlin.math.hypot(distanceX, distanceY)
+        if (pixelDistance < minGesturePanDistancePx) return
+        val nativeCamera = cesiumBridge.panCamera(
+            currentX = currentX,
+            currentY = currentY,
+            distanceX = distanceX,
+            distanceY = distanceY,
+            sensitivity = panSensitivity,
+        )
+        adoptNativeCamera(nativeCamera, source)
     }
 
     private fun applyZoomScale(scaleFactor: Double, focusX: Double, focusY: Double) {
         if (!gestureOptions.zoomEnabled || scaleFactor <= 0.0) return
-        applyZoomDelta(ln(scaleFactor) / ln(2.0), focusX, focusY)
+        applyAltitudeScale(1.0 / scaleFactor, focusX, focusY)
     }
 
     private fun handleTwoFingerGesture(event: MotionEvent): Boolean {
@@ -452,6 +490,7 @@ internal class CesiumMapRenderSurface(
         val secondX = event.getX(1).toDouble()
         val secondY = event.getY(1).toDouble()
         val angleDegrees = Math.toDegrees(atan2(secondY - firstY, secondX - firstX))
+        val focusX = (firstX + secondX) * 0.5
         val focusY = (firstY + secondY) * 0.5
 
         if (
@@ -462,80 +501,95 @@ internal class CesiumMapRenderSurface(
             multiTouchTracking = true
             lastMultiTouchAngleDegrees = angleDegrees
             lastMultiTouchFocusY = focusY
+            lastMultiTouchFirstY = firstY
+            lastMultiTouchSecondY = secondY
             stopInertia()
             return false
         }
 
         if (event.actionMasked != MotionEvent.ACTION_MOVE) return false
 
-        var nextCamera = cameraState
         var changed = false
 
         if (gestureOptions.rotateEnabled) {
-            val bearingDelta = shortestAngleDelta(lastMultiTouchAngleDegrees, angleDegrees)
-            if (abs(bearingDelta) > 0.05) {
-                nextCamera = nextCamera.copy(bearing = nextCamera.bearing + bearingDelta)
+            val bearingDelta = shortestAngleDelta(lastMultiTouchAngleDegrees, angleDegrees) * rotateSensitivity
+            if (abs(bearingDelta) > minRotateDeltaDegrees) {
+                adoptNativeCamera(cesiumBridge.rotateCamera(bearingDelta, focusX, focusY), CameraChangeSource.GESTURE)
                 changed = true
             }
         }
 
         if (gestureOptions.tiltEnabled) {
-            val focusYDelta = focusY - lastMultiTouchFocusY
-            val pitchDelta = focusYDelta * 0.12
-            if (abs(pitchDelta) > 0.05) {
-                nextCamera = nextCamera.copy(pitch = (nextCamera.pitch + pitchDelta).coerceIn(0.0, 85.0))
+            val firstYDelta = firstY - lastMultiTouchFirstY
+            val secondYDelta = secondY - lastMultiTouchSecondY
+            val focusYDelta = if (firstYDelta * secondYDelta > 0.0) {
+                (firstYDelta + secondYDelta) * 0.5
+            } else {
+                focusY - lastMultiTouchFocusY
+            }
+            val pitchDelta = -focusYDelta * tiltSensitivity
+            if (abs(pitchDelta) > minTiltDeltaDegrees) {
+                adoptNativeCamera(cesiumBridge.tiltCamera(pitchDelta, focusX, focusY), CameraChangeSource.GESTURE)
                 changed = true
             }
         }
 
         lastMultiTouchAngleDegrees = angleDegrees
         lastMultiTouchFocusY = focusY
+        lastMultiTouchFirstY = firstY
+        lastMultiTouchSecondY = secondY
 
-        if (changed) {
-            applyCamera(nextCamera.copy(autoOrbit = false), CameraChangeSource.GESTURE)
-        }
         return changed
     }
 
     private fun applyZoomDelta(delta: Double, focusX: Double? = null, focusY: Double? = null) {
         if (!gestureOptions.zoomEnabled || delta == 0.0) return
-        val currentCamera = cameraState
-        var nextCamera =
-            currentCamera.copy(
-                zoom = (currentCamera.zoom + delta).coerceIn(3.0, 19.0),
-                autoOrbit = false,
-            )
-        if (focusX != null && focusY != null) {
-            nextCamera = keepFocusStable(currentCamera, nextCamera, focusX, focusY)
+        applyAltitudeScale(doubleTapAltitudeScale.pow(delta), focusX, focusY)
+    }
+
+    private fun applyAltitudeScale(scale: Double, focusX: Double? = null, focusY: Double? = null) {
+        if (!gestureOptions.zoomEnabled || scale <= 0.0) return
+        val nativeCamera = if (focusX != null && focusY != null) {
+            cesiumBridge.scaleCamera(scale, focusX, focusY)
+        } else {
+            cesiumBridge.scaleCameraFromCenter(scale)
         }
-        applyCamera(nextCamera, CameraChangeSource.GESTURE)
+        adoptNativeCamera(nativeCamera, CameraChangeSource.GESTURE)
     }
 
     private fun applyCamera(camera: CesiumCameraState, source: CameraChangeSource) {
         if (source == CameraChangeSource.PROGRAMMATIC || source == CameraChangeSource.GESTURE) {
             stopInertia()
         }
-        longitude = wrapLongitude(camera.longitude.coerceIn(-180.0, 180.0))
-        latitude = camera.latitude.coerceIn(-85.0, 85.0)
-        zoom = camera.zoom.coerceIn(3.0, 19.0)
-        autoOrbit = camera.autoOrbit
-        bearing = wrapDegrees(camera.bearing)
-        pitch = camera.pitch.coerceIn(0.0, 85.0)
-        val sanitizedCamera = cameraState
-        cesiumBridge.updateCamera(
-            sanitizedCamera.longitude,
-            sanitizedCamera.latitude,
-            sanitizedCamera.zoom,
-            sanitizedCamera.autoOrbit,
-            sanitizedCamera.bearing,
-            sanitizedCamera.pitch,
+        val nativeCamera = cesiumBridge.updateCamera(
+            camera.longitude,
+            camera.latitude,
+            camera.altitudeMeters,
+            camera.autoOrbit,
+            camera.bearing,
+            camera.pitch,
         )
-        onCameraUpdated(sanitizedCamera, source)
+        adoptNativeCamera(nativeCamera, source)
+    }
+
+    private fun adoptNativeCamera(camera: CesiumCameraState, source: CameraChangeSource) {
+        syncLocalCamera(camera)
+        onCameraUpdated(cameraState, source)
+    }
+
+    private fun syncLocalCamera(camera: CesiumCameraState) {
+        longitude = camera.longitude
+        latitude = camera.latitude
+        altitudeMeters = camera.altitudeMeters
+        autoOrbit = camera.autoOrbit
+        bearing = camera.bearing
+        pitch = camera.pitch
     }
 
     private fun onCameraUpdated(camera: CesiumCameraState, source: CameraChangeSource) {
         if (!isCameraMoving) {
             isCameraMoving = true
+            cesiumBridge.setCameraMoving(true)
             mainHandler.post { onCameraMoveStarted?.invoke(camera) }
         }
         applyEffectiveMaximumScreenSpaceError()
@@ -587,40 +641,6 @@ internal class CesiumMapRenderSurface(
         return max(performanceOptions.maximumScreenSpaceError, movementMaximumScreenSpaceError)
     }
 
-    private fun shiftCameraByMeters(
-        baseCamera: CesiumCameraState,
-        eastMeters: Double,
-        northMeters: Double,
-    ): CesiumCameraState {
-        val latRadians = Math.toRadians(baseCamera.latitude)
-        val metersPerDegreeLatitude = 110_540.0
-        val metersPerDegreeLongitude = max(111_320.0 * cos(latRadians), 1_000.0)
-        val longitudeDelta = eastMeters / metersPerDegreeLongitude
-        val latitudeDelta = northMeters / metersPerDegreeLatitude
-        return baseCamera.copy(
-            longitude = wrapLongitude(baseCamera.longitude + longitudeDelta),
-            latitude = (baseCamera.latitude + latitudeDelta).coerceIn(-85.0, 85.0),
-        )
-    }
-
-    private fun keepFocusStable(
-        oldCamera: CesiumCameraState,
-        newCamera: CesiumCameraState,
-        focusX: Double,
-        focusY: Double,
-    ): CesiumCameraState {
-        val centerX = widthPx * 0.5
-        val centerY = heightPx * 0.5
-        val dx = focusX - centerX
-        val dy = focusY - centerY
-        if (dx == 0.0 && dy == 0.0) return newCamera
-        val oldMetersPerPixel = metersPerPixel(oldCamera.latitude, oldCamera.zoom)
-        val newMetersPerPixel = metersPerPixel(newCamera.latitude, newCamera.zoom)
-        val eastMeters = dx * (oldMetersPerPixel - newMetersPerPixel)
-        val northMeters = -dy * (oldMetersPerPixel - newMetersPerPixel)
-        return shiftCameraByMeters(newCamera, eastMeters, northMeters)
-    }
-
     private fun startInertia(velocityX: Double, velocityY: Double) {
         stopInertia()
         inertiaVelocityX = velocityX
@@ -642,6 +662,8 @@ internal class CesiumMapRenderSurface(
         multiTouchTracking = false
         lastMultiTouchAngleDegrees = 0.0
         lastMultiTouchFocusY = 0.0
+        lastMultiTouchFirstY = 0.0
+        lastMultiTouchSecondY = 0.0
     }
 
     private fun shouldRenderFrame(): Boolean {
@@ -667,31 +689,11 @@ internal class CesiumMapRenderSurface(
         fps = 0.0
     }
 
-    private fun metersPerPixel(latitude: Double, zoom: Double): Double {
-        val latRadians = Math.toRadians(latitude.coerceIn(-85.0, 85.0))
-        val scale = 2.0.pow(zoom)
-        return 156543.03392 * cos(latRadians) / scale
-    }
-
-    private fun wrapDegrees(value: Double): Double {
-        var degrees = value
-        while (degrees >= 360.0) degrees -= 360.0
-        while (degrees < 0.0) degrees += 360.0
-        return degrees
-    }
-
     private fun shortestAngleDelta(fromDegrees: Double, toDegrees: Double): Double {
         var delta = toDegrees - fromDegrees
         while (delta > 180.0) delta -= 360.0
         while (delta < -180.0) delta += 360.0
         return delta
-    }
-
-    private fun wrapLongitude(value: Double): Double {
-        var lon = value
-        while (lon > 180.0) lon -= 360.0
-        while (lon < -180.0) lon += 360.0
-        return lon
     }
 }
 

@@ -17,6 +17,7 @@ class CesiumMapView(
 ) : FrameLayout(context), CesiumMapController {
     private val renderSurface = CesiumMapRenderSurface(context)
     private var listener: CesiumMapListener? = null
+    private var currentImagerySource: ImagerySource? = null
 
     internal var onMapReady: (() -> Unit)?
         get() = null
@@ -83,6 +84,13 @@ class CesiumMapView(
         get() = renderSurface.performanceOptions
         set(value) {
             renderSurface.performanceOptions = value
+        }
+
+    override var imagerySource: ImagerySource?
+        get() = currentImagerySource
+        set(value) {
+            currentImagerySource = value
+            renderSurface.imagerySource = value
         }
 
     init {

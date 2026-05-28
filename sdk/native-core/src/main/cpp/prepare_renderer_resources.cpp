@@ -1,11 +1,8 @@
 #include "prepare_renderer_resources.h"
 
-#include "imagery.h"
-
 #include <android/log.h>
 #include <GLES3/gl3.h>
 
-#include <Cesium3DTilesSelection/BoundingVolume.h>
 #include <Cesium3DTilesSelection/Tile.h>
 #include <Cesium3DTilesSelection/TileContent.h>
 #include <CesiumGeospatial/BoundingRegion.h>
@@ -24,32 +21,23 @@
 #include <glm/vec4.hpp>
 
 #include <algorithm>
-#include <array>
+#include <climits>
+#include <cstdlib>
+#include <cstring>
+#include <cstddef>
 #include <memory>
-#include <sstream>
+#include <mutex>
 #include <optional>
 #include <string>
-#include <unordered_map>
-#include <variant>
+#include <unordered_set>
 #include <vector>
 
 namespace cesium_poc {
 namespace {
 
-std::string imageryTextureKey(const ImageryTileResource& imagery) {
-    std::ostringstream stream;
-    stream << imagery.z << "/" << imagery.x << "/" << imagery.y;
-    return stream.str();
-}
-
-std::unordered_map<std::string, std::weak_ptr<GpuTexture>>& imageryTextureCache() {
-    static std::unordered_map<std::string, std::weak_ptr<GpuTexture>> cache;
-    return cache;
-}
-
-std::shared_ptr<GpuTexture> makeTextureResource(GLuint id, size_t bytes) {
+std::shared_ptr<GpuTexture> makeTextureResource(GLuint id, size_t bytes, int32_t width, int32_t height) {
     return std::shared_ptr<GpuTexture>(
-        new GpuTexture{id, bytes},
+        new GpuTexture{id, bytes, width, height},
         [](GpuTexture* texture) {
             if (texture->id != 0) {
                 glDeleteTextures(1, &texture->id);
@@ -58,7 +46,185 @@ std::shared_ptr<GpuTexture> makeTextureResource(GLuint id, size_t bytes) {
         });
 }
 
+struct RasterTextureResource {
+    GLuint texture = 0;
+    size_t bytes = 0;
+    int32_t width = 0;
+    int32_t height = 0;
+    std::vector<std::byte> pixelData;
+    std::shared_ptr<GpuTexture> textureResource;
+    glm::dvec2 atlasTranslation = glm::dvec2(0.0);
+    glm::dvec2 atlasScale = glm::dvec2(1.0);
+    bool queuedForUpload = false;
+    struct PendingAttachment {
+        GpuTileResources* resources = nullptr;
+        int32_t overlayTextureCoordinateID = -1;
+        glm::dvec2 translation = glm::dvec2(0.0);
+        glm::dvec2 scale = glm::dvec2(1.0);
+    };
+    std::vector<PendingAttachment> pendingAttachments;
+    uint64_t uploadPriority = 0;
+};
+
+bool sameRasterAttachment(
+    const RasterAttachment& a,
+    const std::shared_ptr<GpuTexture>& texture,
+    int32_t overlayTextureCoordinateID,
+    const glm::dvec2& translation,
+    const glm::dvec2& scale);
+
+GLuint uploadRgbaTexture(
+    int32_t width,
+    int32_t height,
+    const std::vector<std::byte>& pixelData,
+    GLuint reusableTexture) {
+    if (width <= 0 || height <= 0 || pixelData.empty()) {
+        return 0;
+    }
+
+    const size_t rowBytes = static_cast<size_t>(width) * 4;
+    std::vector<std::byte> glPixelData(pixelData.size());
+    for (int32_t y = 0; y < height; ++y) {
+        const size_t sourceOffset = static_cast<size_t>(y) * rowBytes;
+        const size_t targetOffset = static_cast<size_t>(height - 1 - y) * rowBytes;
+        std::memcpy(glPixelData.data() + targetOffset, pixelData.data() + sourceOffset, rowBytes);
+    }
+
+    GLuint texture = reusableTexture;
+    if (texture == 0) {
+        glGenTextures(1, &texture);
+    }
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(
+        GL_TEXTURE_2D,
+        0,
+        GL_RGBA,
+        width,
+        height,
+        0,
+        GL_RGBA,
+        GL_UNSIGNED_BYTE,
+        glPixelData.data());
+    glGenerateMipmap(GL_TEXTURE_2D);
+    const auto* extensions = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
+    if (extensions && strstr(extensions, "GL_EXT_texture_filter_anisotropic") != nullptr) {
+        constexpr GLenum kTextureMaxAnisotropyExt = 0x84FE;
+        constexpr GLenum kMaxTextureMaxAnisotropyExt = 0x84FF;
+        GLfloat maxAnisotropy = 1.0f;
+        glGetFloatv(kMaxTextureMaxAnisotropyExt, &maxAnisotropy);
+        glTexParameterf(GL_TEXTURE_2D, kTextureMaxAnisotropyExt, std::min(maxAnisotropy, 8.0f));
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return texture;
+}
+
+std::vector<std::byte> flipRgbaRows(
+    int32_t width,
+    int32_t height,
+    const std::vector<std::byte>& pixelData) {
+    const size_t rowBytes = static_cast<size_t>(width) * 4;
+    std::vector<std::byte> glPixelData(pixelData.size());
+    for (int32_t y = 0; y < height; ++y) {
+        const size_t sourceOffset = static_cast<size_t>(y) * rowBytes;
+        const size_t targetOffset = static_cast<size_t>(height - 1 - y) * rowBytes;
+        std::memcpy(glPixelData.data() + targetOffset, pixelData.data() + sourceOffset, rowBytes);
+    }
+    return glPixelData;
+}
+
+glm::dvec2 combineAtlasTranslation(
+    const glm::dvec2& translation,
+    const glm::dvec2& atlasTranslation,
+    const glm::dvec2& atlasScale) {
+    return atlasTranslation + translation * atlasScale;
+}
+
+void attachRasterToResources(
+    GpuTileResources& resources,
+    const std::shared_ptr<GpuTexture>& textureResource,
+    int32_t overlayTextureCoordinateID,
+    const glm::dvec2& translation,
+    const glm::dvec2& scale) {
+    if (!textureResource) return;
+    RasterAttachment attachment;
+    attachment.textureResource = textureResource;
+    attachment.overlayTextureCoordinateID = overlayTextureCoordinateID;
+    attachment.translation = translation;
+    attachment.scale = scale;
+    for (GpuPrimitive& primitive : resources.primitives) {
+        const bool duplicate = std::any_of(
+            primitive.rasterAttachments.begin(),
+            primitive.rasterAttachments.end(),
+            [&attachment](const RasterAttachment& existing) {
+                return sameRasterAttachment(
+                    existing,
+                    attachment.textureResource,
+                    attachment.overlayTextureCoordinateID,
+                    attachment.translation,
+                    attachment.scale);
+            });
+        if (duplicate) continue;
+        primitive.rasterAttachments.push_back(attachment);
+    }
+}
+
+std::optional<int32_t> overlayTextureCoordinateID(const std::string& attributeName) {
+    constexpr const char* prefix = "_CESIUMOVERLAY_";
+    const size_t prefixLength = std::char_traits<char>::length(prefix);
+    if (attributeName.rfind(prefix, 0) != 0 || attributeName.size() == prefixLength) {
+        return std::nullopt;
+    }
+    char* end = nullptr;
+    const long value = std::strtol(attributeName.c_str() + prefixLength, &end, 10);
+    if (end == nullptr || *end != '\0' || value < 0 || value > INT32_MAX) {
+        return std::nullopt;
+    }
+    return static_cast<int32_t>(value);
+}
+
+GLuint uploadVertexBuffer(const std::vector<float>& vertexData) {
+    GLuint vertexBuffer = 0;
+    glGenBuffers(1, &vertexBuffer);
+    glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
+    glBufferData(
+        GL_ARRAY_BUFFER,
+        static_cast<GLsizeiptr>(vertexData.size() * sizeof(float)),
+        vertexData.data(),
+        GL_STATIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    return vertexBuffer;
+}
+
+bool sameRasterAttachment(
+    const RasterAttachment& a,
+    const std::shared_ptr<GpuTexture>& texture,
+    int32_t overlayTextureCoordinateID,
+    const glm::dvec2& translation,
+    const glm::dvec2& scale) {
+    return a.textureResource == texture &&
+        a.overlayTextureCoordinateID == overlayTextureCoordinateID &&
+        std::abs(a.translation.x - translation.x) < 1e-12 &&
+        std::abs(a.translation.y - translation.y) < 1e-12 &&
+        std::abs(a.scale.x - scale.x) < 1e-12 &&
+        std::abs(a.scale.y - scale.y) < 1e-12;
+}
+
 } // namespace
+
+MinimalPrepareRendererResources::~MinimalPrepareRendererResources() {
+    std::lock_guard<std::mutex> lock(_uploadMutex);
+    for (ReusableTexture& texture : _reusableTextures) {
+        if (texture.id != 0) {
+            glDeleteTextures(1, &texture.id);
+            texture.id = 0;
+        }
+    }
+    _reusableTextures.clear();
+}
 
 CesiumAsync::Future<Cesium3DTilesSelection::TileLoadResultAndRenderResources>
 MinimalPrepareRendererResources::prepareInLoadThread(
@@ -66,23 +232,16 @@ MinimalPrepareRendererResources::prepareInLoadThread(
     Cesium3DTilesSelection::TileLoadResult&& tileLoadResult,
     const glm::dmat4&,
     const std::any&) {
-    std::unique_ptr<LoadTileResources> loadResources;
-    if (tileLoadResult.state == Cesium3DTilesSelection::TileLoadResultState::Success) {
-        loadResources = prepareTileImageInLoadThread(tileLoadResult);
-    }
     return asyncSystem.createResolvedFuture(
         Cesium3DTilesSelection::TileLoadResultAndRenderResources{
             std::move(tileLoadResult),
-            loadResources.release()});
+            nullptr});
 }
 
 void* MinimalPrepareRendererResources::prepareInMainThread(
     Cesium3DTilesSelection::Tile& tile,
     void* pLoadThreadResult) {
-    std::unique_ptr<LoadTileResources> loadResources;
-    if (isLoadThreadResource(pLoadThreadResult)) {
-        loadResources.reset(reinterpret_cast<LoadTileResources*>(pLoadThreadResult));
-    }
+    delete reinterpret_cast<Marker*>(pLoadThreadResult);
 
     const Cesium3DTilesSelection::TileRenderContent* renderContent =
         tile.getContent().getRenderContent();
@@ -91,11 +250,10 @@ void* MinimalPrepareRendererResources::prepareInMainThread(
     }
 
     auto resources = std::make_unique<GpuTileResources>();
-    const LoadTileResources* loadResourcesPtr = loadResources.get();
     const CesiumGltf::Model& model = renderContent->getModel();
     model.forEachNodeInScene(
         -1,
-        [resources = resources.get(), &tile, loadResourcesPtr](
+        [resources = resources.get(), &tile](
             const CesiumGltf::Model& gltf,
             const CesiumGltf::Node& node,
             const glm::dmat4& nodeTransform) {
@@ -108,43 +266,70 @@ void* MinimalPrepareRendererResources::prepareInMainThread(
                 if (primitive.mode != CesiumGltf::MeshPrimitive::Mode::TRIANGLES) {
                     continue;
                 }
-                appendPrimitive(gltf, primitive, transform, tile, loadResourcesPtr, *resources);
+                appendPrimitive(gltf, primitive, transform, tile, *resources);
             }
         });
 
-    return resources.release();
+    GpuTileResources* result = resources.release();
+    queueGeometryUpload(result);
+    return result;
 }
 
 void MinimalPrepareRendererResources::free(
     Cesium3DTilesSelection::Tile&,
     void* pLoadThreadResult,
     void* pMainThreadResult) noexcept {
-    if (isLoadThreadResource(pLoadThreadResult)) {
-        delete reinterpret_cast<LoadTileResources*>(pLoadThreadResult);
-    } else {
-        delete reinterpret_cast<Marker*>(pLoadThreadResult);
-    }
+    delete reinterpret_cast<Marker*>(pLoadThreadResult);
     auto* resources = reinterpret_cast<GpuTileResources*>(pMainThreadResult);
+    removeGeometryUpload(resources);
+    removePendingRasterAttachments(resources);
     if (resources) {
         for (const GpuPrimitive& primitive : resources->primitives) {
             if (primitive.vertexBuffer != 0) glDeleteBuffers(1, &primitive.vertexBuffer);
             if (primitive.indexBuffer != 0) glDeleteBuffers(1, &primitive.indexBuffer);
+            for (const OverlayVertexBuffer& overlay : primitive.overlayVertexBuffers) {
+                if (overlay.vertexBuffer != 0 && overlay.vertexBuffer != primitive.vertexBuffer) {
+                    glDeleteBuffers(1, &overlay.vertexBuffer);
+                }
+            }
         }
     }
     delete resources;
 }
 
 void* MinimalPrepareRendererResources::prepareRasterInLoadThread(
-    CesiumGltf::ImageAsset&,
+    CesiumGltf::ImageAsset& image,
     const std::any&) {
+    if (image.compressedPixelFormat == CesiumGltf::GpuCompressedPixelFormat::NONE &&
+        image.bytesPerChannel == 1 &&
+        image.channels > 0 &&
+        image.channels != 4) {
+        image.changeNumberOfChannels(4, std::byte{255});
+    }
     return new Marker();
 }
 
 void* MinimalPrepareRendererResources::prepareRasterInMainThread(
-    CesiumRasterOverlays::RasterOverlayTile&,
+    CesiumRasterOverlays::RasterOverlayTile& rasterTile,
     void* pLoadThreadResult) {
     delete reinterpret_cast<Marker*>(pLoadThreadResult);
-    return new Marker();
+    CesiumUtility::IntrusivePointer<const CesiumGltf::ImageAsset> image = rasterTile.getImage();
+    if (!image) return nullptr;
+    if (image->width <= 0 ||
+        image->height <= 0 ||
+        image->bytesPerChannel != 1 ||
+        image->channels != 4 ||
+        image->pixelData.empty() ||
+        image->compressedPixelFormat != CesiumGltf::GpuCompressedPixelFormat::NONE) {
+        return nullptr;
+    }
+    auto* resource = new RasterTextureResource();
+    resource->width = image->width;
+    resource->height = image->height;
+    resource->bytes = static_cast<size_t>(image->width) * static_cast<size_t>(image->height) * 4;
+    resource->pixelData = image->pixelData;
+    queueRasterUpload(resource);
+    return resource;
 }
 
 void MinimalPrepareRendererResources::freeRaster(
@@ -152,27 +337,112 @@ void MinimalPrepareRendererResources::freeRaster(
     void* pLoadThreadResult,
     void* pMainThreadResult) noexcept {
     delete reinterpret_cast<Marker*>(pLoadThreadResult);
-    delete reinterpret_cast<Marker*>(pMainThreadResult);
+    auto* resource = reinterpret_cast<RasterTextureResource*>(pMainThreadResult);
+    removeRasterUpload(resource);
+    if (resource && resource->texture != 0) {
+        glDeleteTextures(1, &resource->texture);
+    }
+    if (resource && resource->textureResource && resource->textureResource.use_count() == 1) {
+        const GLuint texture = resource->textureResource->id;
+        resource->textureResource->id = 0;
+        cacheReusableTexture(texture, resource->width, resource->height, resource->bytes);
+        resource->textureResource.reset();
+    }
+    delete resource;
 }
 
 void MinimalPrepareRendererResources::attachRasterInMainThread(
-    const Cesium3DTilesSelection::Tile&,
-    int32_t,
+    const Cesium3DTilesSelection::Tile& tile,
+    int32_t overlayTextureCoordinateID,
     const CesiumRasterOverlays::RasterOverlayTile&,
-    void*,
-    const glm::dvec2&,
-    const glm::dvec2&) {}
+    void* pMainThreadRendererResources,
+    const glm::dvec2& translation,
+    const glm::dvec2& scale) {
+    auto* raster = reinterpret_cast<RasterTextureResource*>(pMainThreadRendererResources);
+    if (!raster) return;
+
+    const Cesium3DTilesSelection::TileRenderContent* renderContent =
+        tile.getContent().getRenderContent();
+    if (!renderContent) return;
+    const void* rawResources = renderContent->getRenderResources();
+    auto* resources = isGpuResource(rawResources)
+        ? const_cast<GpuTileResources*>(reinterpret_cast<const GpuTileResources*>(rawResources))
+        : nullptr;
+    if (!resources) return;
+
+    if (!raster->textureResource) {
+        const bool duplicatePending = std::any_of(
+            raster->pendingAttachments.begin(),
+            raster->pendingAttachments.end(),
+            [resources, overlayTextureCoordinateID, &translation, &scale](
+                const RasterTextureResource::PendingAttachment& pending) {
+                return pending.resources == resources &&
+                    pending.overlayTextureCoordinateID == overlayTextureCoordinateID &&
+                    std::abs(pending.translation.x - translation.x) < 1e-12 &&
+                    std::abs(pending.translation.y - translation.y) < 1e-12 &&
+                    std::abs(pending.scale.x - scale.x) < 1e-12 &&
+                    std::abs(pending.scale.y - scale.y) < 1e-12;
+            });
+        if (!duplicatePending) {
+            raster->pendingAttachments.push_back(
+                RasterTextureResource::PendingAttachment{
+                    resources,
+                    overlayTextureCoordinateID,
+                    translation,
+                    scale});
+        }
+        return;
+    }
+    attachRasterToResources(
+        *resources,
+        raster->textureResource,
+        overlayTextureCoordinateID,
+        combineAtlasTranslation(translation, raster->atlasTranslation, raster->atlasScale),
+        scale * raster->atlasScale);
+}
 
 void MinimalPrepareRendererResources::detachRasterInMainThread(
-    const Cesium3DTilesSelection::Tile&,
-    int32_t,
+    const Cesium3DTilesSelection::Tile& tile,
+    int32_t overlayTextureCoordinateID,
     const CesiumRasterOverlays::RasterOverlayTile&,
-    void*) noexcept {}
+    void* pMainThreadRendererResources) noexcept {
+    auto* raster = reinterpret_cast<RasterTextureResource*>(pMainThreadRendererResources);
+    if (!raster) return;
 
-bool MinimalPrepareRendererResources::isLoadThreadResource(void* resource) {
-    if (!resource) return false;
-    const auto* header = reinterpret_cast<const RenderResourceHeader*>(resource);
-    return header->kind == RenderResourceKind::LoadThread;
+    const Cesium3DTilesSelection::TileRenderContent* renderContent =
+        tile.getContent().getRenderContent();
+    if (!renderContent) return;
+    const void* rawResources = renderContent->getRenderResources();
+    auto* resources = isGpuResource(rawResources)
+        ? const_cast<GpuTileResources*>(reinterpret_cast<const GpuTileResources*>(rawResources))
+        : nullptr;
+    if (!resources) return;
+
+    raster->pendingAttachments.erase(
+        std::remove_if(
+            raster->pendingAttachments.begin(),
+            raster->pendingAttachments.end(),
+            [resources, overlayTextureCoordinateID](const RasterTextureResource::PendingAttachment& pending) {
+                return pending.resources == resources &&
+                    pending.overlayTextureCoordinateID == overlayTextureCoordinateID;
+            }),
+        raster->pendingAttachments.end());
+
+    if (!raster->textureResource) return;
+
+    for (GpuPrimitive& primitive : resources->primitives) {
+        const size_t before = primitive.rasterAttachments.size();
+        primitive.rasterAttachments.erase(
+            std::remove_if(
+                primitive.rasterAttachments.begin(),
+                primitive.rasterAttachments.end(),
+                [texture = raster->textureResource, overlayTextureCoordinateID](const RasterAttachment& attachment) {
+                    return attachment.textureResource == texture &&
+                           attachment.overlayTextureCoordinateID == overlayTextureCoordinateID;
+                }),
+            primitive.rasterAttachments.end());
+        (void)before;
+    }
 }
 
 bool MinimalPrepareRendererResources::isGpuResource(const void* resource) {
@@ -181,56 +451,368 @@ bool MinimalPrepareRendererResources::isGpuResource(const void* resource) {
     return header->kind == RenderResourceKind::MainThreadGpu;
 }
 
-std::unique_ptr<LoadTileResources>
-MinimalPrepareRendererResources::prepareTileImageInLoadThread(
-    const Cesium3DTilesSelection::TileLoadResult& tileLoadResult) {
-    const Cesium3DTilesSelection::BoundingVolume* boundingVolume = nullptr;
-    if (tileLoadResult.updatedBoundingVolume) {
-        boundingVolume = &*tileLoadResult.updatedBoundingVolume;
-    } else if (tileLoadResult.initialBoundingVolume) {
-        boundingVolume = &*tileLoadResult.initialBoundingVolume;
-    }
-    if (!boundingVolume) return nullptr;
-
-    const std::vector<SatelliteTileId> tileIds = satelliteTileIdsForRegion(*boundingVolume);
-    if (tileIds.empty()) return nullptr;
-
-    auto resources = std::make_unique<LoadTileResources>();
-    resources->imageryTiles.reserve(tileIds.size());
-    for (const SatelliteTileId& id : tileIds) {
-        uint32_t z = id.z;
-        uint32_t x = id.x;
-        uint32_t y = id.y;
-        std::shared_ptr<const ImageRgba> image;
-        while (true) {
-            image = imageForSatelliteTile(z, x, y);
-            if (image && !image->pixels.empty()) break;
-            if (z == 0) break;
-            --z;
-            x /= 2;
-            y /= 2;
-        }
-        if (image && !image->pixels.empty()) {
-            resources->imageryTiles.push_back({std::move(image), z, x, y});
+void MinimalPrepareRendererResources::prioritizeVisibleResources(
+    const std::vector<const GpuTileResources*>& visibleResources) {
+    std::lock_guard<std::mutex> lock(_uploadMutex);
+    ++_uploadPriorityCounter;
+    const uint64_t priority = _uploadPriorityCounter;
+    std::unordered_set<const GpuTileResources*> visibleSet;
+    visibleSet.reserve(visibleResources.size());
+    for (const GpuTileResources* resources : visibleResources) {
+        if (resources) {
+            visibleSet.insert(resources);
+            const_cast<GpuTileResources*>(resources)->uploadPriority = priority;
         }
     }
-    if (resources->imageryTiles.empty()) return nullptr;
-    return resources;
+    for (void* rawRaster : _pendingRasterUploads) {
+        auto* raster = reinterpret_cast<RasterTextureResource*>(rawRaster);
+        if (!raster) continue;
+        for (const RasterTextureResource::PendingAttachment& pending : raster->pendingAttachments) {
+            if (pending.resources && visibleSet.find(pending.resources) != visibleSet.end()) {
+                raster->uploadPriority = priority;
+                break;
+            }
+        }
+    }
+}
+
+size_t MinimalPrepareRendererResources::processPendingGeometryUploads(size_t maxPrimitives) {
+    if (maxPrimitives == 0) return 0;
+    std::lock_guard<std::mutex> lock(_uploadMutex);
+    std::stable_sort(
+        _pendingGeometryUploads.begin(),
+        _pendingGeometryUploads.end(),
+        [](const GpuTileResources* a, const GpuTileResources* b) {
+            const uint64_t priorityA = a ? a->uploadPriority : 0;
+            const uint64_t priorityB = b ? b->uploadPriority : 0;
+            return priorityA > priorityB;
+        });
+    size_t uploaded = 0;
+    auto it = _pendingGeometryUploads.begin();
+    while (it != _pendingGeometryUploads.end() && uploaded < maxPrimitives) {
+        GpuTileResources* resources = *it;
+        if (!resources) {
+            it = _pendingGeometryUploads.erase(it);
+            continue;
+        }
+
+        bool complete = true;
+        for (GpuPrimitive& primitive : resources->primitives) {
+            if (primitive.buffersUploaded) continue;
+            uploadPrimitiveBuffers(primitive);
+            primitive.buffersUploaded = primitive.vertexBuffer != 0 && primitive.indexBuffer != 0;
+            ++uploaded;
+            if (uploaded >= maxPrimitives) {
+                complete = false;
+                break;
+            }
+        }
+
+        if (complete) {
+            resources->queuedForUpload = false;
+            it = _pendingGeometryUploads.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    return uploaded;
+}
+
+bool MinimalPrepareRendererResources::uploadRasterToAtlas(
+    int32_t width,
+    int32_t height,
+    const std::vector<std::byte>& pixelData,
+    std::shared_ptr<GpuTexture>& textureResource,
+    glm::dvec2& atlasTranslation,
+    glm::dvec2& atlasScale) {
+    constexpr int32_t atlasWidth = 4096;
+    constexpr int32_t atlasHeight = 4096;
+    constexpr int32_t gutter = 1;
+    constexpr int32_t padding = 1;
+    const int32_t packedWidth = width + gutter * 2;
+    const int32_t packedHeight = height + gutter * 2;
+    if (width <= 0 ||
+        height <= 0 ||
+        packedWidth + padding > atlasWidth ||
+        packedHeight + padding > atlasHeight ||
+        pixelData.empty()) {
+        return false;
+    }
+
+    RasterAtlas* targetAtlas = nullptr;
+    for (RasterAtlas& atlas : _rasterAtlases) {
+        if (atlas.cursorX + packedWidth > atlas.width) {
+            atlas.cursorX = 0;
+            atlas.cursorY += atlas.rowHeight + padding;
+            atlas.rowHeight = 0;
+        }
+        if (atlas.cursorY + packedHeight <= atlas.height) {
+            targetAtlas = &atlas;
+            break;
+        }
+    }
+
+    if (!targetAtlas) {
+        RasterAtlas atlas;
+        atlas.width = atlasWidth;
+        atlas.height = atlasHeight;
+        GLuint texture = 0;
+        glGenTextures(1, &texture);
+        if (texture == 0) return false;
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            GL_RGBA,
+            atlas.width,
+            atlas.height,
+            0,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            nullptr);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        atlas.textureResource = makeTextureResource(
+            texture,
+            static_cast<size_t>(atlas.width) * static_cast<size_t>(atlas.height) * 4,
+            atlas.width,
+            atlas.height);
+        _rasterAtlases.push_back(std::move(atlas));
+        targetAtlas = &_rasterAtlases.back();
+    }
+
+    const int32_t x = targetAtlas->cursorX;
+    const int32_t y = targetAtlas->cursorY;
+    const int32_t innerX = x + gutter;
+    const int32_t innerY = y + gutter;
+    const std::vector<std::byte> glPixelData = flipRgbaRows(width, height, pixelData);
+    glBindTexture(GL_TEXTURE_2D, targetAtlas->textureResource->id);
+    glTexSubImage2D(
+        GL_TEXTURE_2D,
+        0,
+        innerX,
+        innerY,
+        width,
+        height,
+        GL_RGBA,
+        GL_UNSIGNED_BYTE,
+        glPixelData.data());
+
+    std::vector<std::byte> edgeColumn(static_cast<size_t>(height) * 4);
+    for (int32_t row = 0; row < height; ++row) {
+        std::memcpy(
+            edgeColumn.data() + static_cast<size_t>(row) * 4,
+            glPixelData.data() + static_cast<size_t>(row) * static_cast<size_t>(width) * 4,
+            4);
+    }
+    glTexSubImage2D(
+        GL_TEXTURE_2D,
+        0,
+        x,
+        innerY,
+        gutter,
+        height,
+        GL_RGBA,
+        GL_UNSIGNED_BYTE,
+        edgeColumn.data());
+    for (int32_t row = 0; row < height; ++row) {
+        std::memcpy(
+            edgeColumn.data() + static_cast<size_t>(row) * 4,
+            glPixelData.data() +
+                (static_cast<size_t>(row) * static_cast<size_t>(width) + static_cast<size_t>(width - 1)) * 4,
+            4);
+    }
+    glTexSubImage2D(
+        GL_TEXTURE_2D,
+        0,
+        innerX + width,
+        innerY,
+        gutter,
+        height,
+        GL_RGBA,
+        GL_UNSIGNED_BYTE,
+        edgeColumn.data());
+
+    glTexSubImage2D(
+        GL_TEXTURE_2D,
+        0,
+        innerX,
+        y,
+        width,
+        gutter,
+        GL_RGBA,
+        GL_UNSIGNED_BYTE,
+        glPixelData.data());
+    glTexSubImage2D(
+        GL_TEXTURE_2D,
+        0,
+        innerX,
+        innerY + height,
+        width,
+        gutter,
+        GL_RGBA,
+        GL_UNSIGNED_BYTE,
+        glPixelData.data() + static_cast<size_t>(height - 1) * static_cast<size_t>(width) * 4);
+
+    const std::byte bottomLeft[4] = {
+        glPixelData[0],
+        glPixelData[1],
+        glPixelData[2],
+        glPixelData[3]};
+    const size_t bottomRightOffset = static_cast<size_t>(width - 1) * 4;
+    const std::byte bottomRight[4] = {
+        glPixelData[bottomRightOffset],
+        glPixelData[bottomRightOffset + 1],
+        glPixelData[bottomRightOffset + 2],
+        glPixelData[bottomRightOffset + 3]};
+    const size_t topLeftOffset = static_cast<size_t>(height - 1) * static_cast<size_t>(width) * 4;
+    const std::byte topLeft[4] = {
+        glPixelData[topLeftOffset],
+        glPixelData[topLeftOffset + 1],
+        glPixelData[topLeftOffset + 2],
+        glPixelData[topLeftOffset + 3]};
+    const size_t topRightOffset =
+        (static_cast<size_t>(height - 1) * static_cast<size_t>(width) + static_cast<size_t>(width - 1)) * 4;
+    const std::byte topRight[4] = {
+        glPixelData[topRightOffset],
+        glPixelData[topRightOffset + 1],
+        glPixelData[topRightOffset + 2],
+        glPixelData[topRightOffset + 3]};
+    glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, gutter, gutter, GL_RGBA, GL_UNSIGNED_BYTE, bottomLeft);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, innerX + width, y, gutter, gutter, GL_RGBA, GL_UNSIGNED_BYTE, bottomRight);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, x, innerY + height, gutter, gutter, GL_RGBA, GL_UNSIGNED_BYTE, topLeft);
+    glTexSubImage2D(
+        GL_TEXTURE_2D,
+        0,
+        innerX + width,
+        innerY + height,
+        gutter,
+        gutter,
+        GL_RGBA,
+        GL_UNSIGNED_BYTE,
+        topRight);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    textureResource = targetAtlas->textureResource;
+    atlasTranslation = glm::dvec2(
+        static_cast<double>(innerX) / static_cast<double>(targetAtlas->width),
+        static_cast<double>(innerY) / static_cast<double>(targetAtlas->height));
+    atlasScale = glm::dvec2(
+        static_cast<double>(width) / static_cast<double>(targetAtlas->width),
+        static_cast<double>(height) / static_cast<double>(targetAtlas->height));
+
+    targetAtlas->cursorX += packedWidth + padding;
+    targetAtlas->rowHeight = std::max(targetAtlas->rowHeight, packedHeight);
+    return true;
+}
+
+size_t MinimalPrepareRendererResources::processPendingRasterUploads(size_t maxTextures) {
+    if (maxTextures == 0) return 0;
+    std::lock_guard<std::mutex> lock(_uploadMutex);
+    std::stable_sort(
+        _pendingRasterUploads.begin(),
+        _pendingRasterUploads.end(),
+        [](const void* a, const void* b) {
+            const auto* rasterA = reinterpret_cast<const RasterTextureResource*>(a);
+            const auto* rasterB = reinterpret_cast<const RasterTextureResource*>(b);
+            const uint64_t priorityA = rasterA ? rasterA->uploadPriority : 0;
+            const uint64_t priorityB = rasterB ? rasterB->uploadPriority : 0;
+            return priorityA > priorityB;
+        });
+    size_t uploaded = 0;
+    auto it = _pendingRasterUploads.begin();
+    while (it != _pendingRasterUploads.end() && uploaded < maxTextures) {
+        auto* raster = reinterpret_cast<RasterTextureResource*>(*it);
+        if (!raster) {
+            it = _pendingRasterUploads.erase(it);
+            continue;
+        }
+        if (!raster->textureResource) {
+            const bool uploadedToAtlas = uploadRasterToAtlas(
+                raster->width,
+                raster->height,
+                raster->pixelData,
+                raster->textureResource,
+                raster->atlasTranslation,
+                raster->atlasScale);
+            if (!uploadedToAtlas) {
+                raster->texture = uploadRgbaTexture(
+                    raster->width,
+                    raster->height,
+                    raster->pixelData,
+                    acquireReusableTexture(raster->width, raster->height));
+            }
+            if (raster->textureResource || raster->texture != 0) {
+                if (!raster->textureResource) {
+                raster->textureResource = makeTextureResource(
+                    raster->texture,
+                    raster->bytes,
+                    raster->width,
+                    raster->height);
+                raster->texture = 0;
+                }
+                raster->pixelData.clear();
+                raster->pixelData.shrink_to_fit();
+                for (const RasterTextureResource::PendingAttachment& pending : raster->pendingAttachments) {
+                    if (!pending.resources) continue;
+                    attachRasterToResources(
+                        *pending.resources,
+                        raster->textureResource,
+                        pending.overlayTextureCoordinateID,
+                        combineAtlasTranslation(
+                            pending.translation,
+                            raster->atlasTranslation,
+                            raster->atlasScale),
+                        pending.scale * raster->atlasScale);
+                }
+                raster->pendingAttachments.clear();
+            }
+            ++uploaded;
+        }
+        raster->queuedForUpload = false;
+        it = _pendingRasterUploads.erase(it);
+    }
+    return uploaded;
+}
+
+size_t MinimalPrepareRendererResources::pendingGeometryUploads() const {
+    std::lock_guard<std::mutex> lock(_uploadMutex);
+    size_t pending = 0;
+    for (const GpuTileResources* resources : _pendingGeometryUploads) {
+        if (!resources) continue;
+        for (const GpuPrimitive& primitive : resources->primitives) {
+            if (!primitive.buffersUploaded) ++pending;
+        }
+    }
+    return pending;
+}
+
+size_t MinimalPrepareRendererResources::pendingRasterUploads() const {
+    std::lock_guard<std::mutex> lock(_uploadMutex);
+    return _pendingRasterUploads.size();
 }
 
 void MinimalPrepareRendererResources::appendPrimitive(
     const CesiumGltf::Model& model,
     const CesiumGltf::MeshPrimitive& primitive,
     const glm::dmat4& transform,
-    const Cesium3DTilesSelection::Tile& tile,
-    const LoadTileResources* loadResources,
+    const Cesium3DTilesSelection::Tile&,
     GpuTileResources& resources) {
     static int logBudget = 12;
     int32_t positionAccessor = -1;
+    int32_t overlayUvAccessor = -1;
+    std::vector<std::pair<int32_t, int32_t>> overlayAccessors;
     for (const auto& entry : primitive.attributes) {
         if (entry.first == "POSITION") {
             positionAccessor = entry.second;
-            break;
+        } else if (const std::optional<int32_t> id = overlayTextureCoordinateID(entry.first)) {
+            overlayAccessors.push_back({*id, entry.second});
+            if (*id == 0) {
+                overlayUvAccessor = entry.second;
+            }
         }
     }
     if (positionAccessor < 0) {
@@ -243,6 +825,24 @@ void MinimalPrepareRendererResources::appendPrimitive(
             __android_log_print(ANDROID_LOG_WARN, "CesiumBridge", "skip primitive: no POSITION attrs=%s", keys.c_str());
         }
         return;
+    }
+    if (overlayAccessors.empty()) {
+        if (logBudget-- > 0) {
+            std::string keys;
+            for (const auto& entry : primitive.attributes) {
+                if (!keys.empty()) keys += ",";
+                keys += entry.first;
+            }
+            __android_log_print(
+                ANDROID_LOG_WARN,
+                "CesiumBridge",
+                "skip primitive: no Cesium overlay UV attrs=%s",
+                keys.c_str());
+        }
+        return;
+    }
+    if (overlayUvAccessor < 0) {
+        overlayUvAccessor = overlayAccessors.front().second;
     }
 
     CesiumGltf::AccessorView<CesiumGltf::AccessorTypes::VEC3<float>> positions(
@@ -262,23 +862,25 @@ void MinimalPrepareRendererResources::appendPrimitive(
         return;
     }
 
-    const CesiumGeospatial::BoundingRegion* region =
-        Cesium3DTilesSelection::getBoundingRegionFromBoundingVolume(tile.getBoundingVolume());
-    if (!region) {
-        if (logBudget-- > 0) __android_log_print(ANDROID_LOG_WARN, "CesiumBridge", "skip primitive: no bounding region");
+    CesiumGltf::AccessorView<CesiumGltf::AccessorTypes::VEC2<float>> overlayUvs(
+        model,
+        overlayUvAccessor);
+    if (overlayUvAccessor >= 0 &&
+        (overlayUvs.status() != CesiumGltf::AccessorViewStatus::Valid ||
+         overlayUvs.size() != positions.size())) {
+        if (logBudget-- > 0) {
+            __android_log_print(
+                ANDROID_LOG_WARN,
+                "CesiumBridge",
+                "skip primitive: invalid Cesium overlay UV status=%d size=%lld positions=%lld accessor=%d",
+                static_cast<int>(overlayUvs.status()),
+                static_cast<long long>(overlayUvs.size()),
+                static_cast<long long>(positions.size()),
+                overlayUvAccessor);
+        }
         return;
     }
-
-    const CesiumGeospatial::GlobeRectangle& rectangle = region->getRectangle();
-    const double west = rectangle.getWest();
-    const double south = rectangle.getSouth();
-    const double lonSpan = std::max(rectangle.getEast() - west, 0.00000001);
-    const double latSpan = std::max(rectangle.getNorth() - south, 0.00000001);
-
-    const std::vector<ImageryTileResource>* imageryTiles = loadResources && !loadResources->imageryTiles.empty()
-        ? &loadResources->imageryTiles
-        : nullptr;
-    const size_t regionCount = imageryTiles ? imageryTiles->size() : 1;
+    const size_t regionCount = 1;
     std::vector<GpuPrimitive> gpuPrimitives(regionCount);
     std::vector<std::vector<float>> vertexDataByRegion(regionCount);
     for (std::vector<float>& vertexData : vertexDataByRegion) {
@@ -295,33 +897,14 @@ void MinimalPrepareRendererResources::appendPrimitive(
             }
             hasOrigin = true;
         }
-        const std::optional<CesiumGeospatial::Cartographic> cartographic =
-            CesiumGeospatial::Ellipsoid::WGS84.cartesianToCartographic(ecef);
-        if (!cartographic) {
-            if (logBudget-- > 0) __android_log_print(ANDROID_LOG_WARN, "CesiumBridge", "skip primitive: cartographic failed");
-            return;
-        }
-
-        const double longitude = cartographic->longitude;
-        const double latitude = cartographic->latitude;
         const glm::dvec3 relative = ecef - gpuPrimitives.front().originEcef;
         for (size_t region = 0; region < regionCount; ++region) {
             std::vector<float>& vertexData = vertexDataByRegion[region];
             vertexData.push_back(static_cast<float>(relative.x));
             vertexData.push_back(static_cast<float>(relative.y));
             vertexData.push_back(static_cast<float>(relative.z));
-            glm::dvec2 uv;
-            if (imageryTiles) {
-                const ImageryTileResource& imagery = (*imageryTiles)[region];
-                uv = unclampedWebMercatorTileUv(
-                    longitude,
-                    latitude,
-                    imagery.z,
-                    imagery.x,
-                    imagery.y);
-            } else {
-                uv = glm::dvec2((longitude - west) / lonSpan, (latitude - south) / latSpan);
-            }
+            const auto& overlayUv = overlayUvs[i];
+            const glm::dvec2 uv(overlayUv.value[0], overlayUv.value[1]);
             vertexData.push_back(static_cast<float>(uv.x));
             vertexData.push_back(static_cast<float>(uv.y));
         }
@@ -341,25 +924,50 @@ void MinimalPrepareRendererResources::appendPrimitive(
 
     for (size_t region = 0; region < regionCount; ++region) {
         GpuPrimitive& gpu = gpuPrimitives[region];
-        uploadIndexBuffer(cpuIndices, gpu);
         std::vector<float>& vertexData = vertexDataByRegion[region];
-        glGenBuffers(1, &gpu.vertexBuffer);
-        glBindBuffer(GL_ARRAY_BUFFER, gpu.vertexBuffer);
-        glBufferData(
-            GL_ARRAY_BUFFER,
-            static_cast<GLsizeiptr>(vertexData.size() * sizeof(float)),
-            vertexData.data(),
-            GL_STATIC_DRAW);
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
 
         gpu.cpuVertexData = std::move(vertexData);
-        if (imageryTiles) {
-            gpu.image = (*imageryTiles)[region].image;
+        gpu.baseCpuVertexData = gpu.cpuVertexData;
+        if (region == 0 && hasOrigin) {
+            for (const auto& [overlayID, accessorID] : overlayAccessors) {
+                if (accessorID == overlayUvAccessor) {
+                    gpu.overlayVertexBuffers.push_back(
+                        OverlayVertexBuffer{overlayID, 0, gpu.cpuVertexData});
+                    continue;
+                }
+
+                CesiumGltf::AccessorView<CesiumGltf::AccessorTypes::VEC2<float>> extraOverlayUvs(
+                    model,
+                    accessorID);
+                if (extraOverlayUvs.status() != CesiumGltf::AccessorViewStatus::Valid ||
+                    extraOverlayUvs.size() != positions.size()) {
+                    continue;
+                }
+
+                std::vector<float> overlayVertexData;
+                overlayVertexData.reserve(static_cast<size_t>(positions.size()) * 5);
+                for (int64_t i = 0; i < positions.size(); ++i) {
+                    const auto& p = positions[i];
+                    const glm::dvec3 ecef = glm::dvec3(
+                        transform * glm::dvec4(p.value[0], p.value[1], p.value[2], 1.0));
+                    const glm::dvec3 relative = ecef - gpu.originEcef;
+                    const auto& uv = extraOverlayUvs[i];
+                    overlayVertexData.push_back(static_cast<float>(relative.x));
+                    overlayVertexData.push_back(static_cast<float>(relative.y));
+                    overlayVertexData.push_back(static_cast<float>(relative.z));
+                    overlayVertexData.push_back(uv.value[0]);
+                    overlayVertexData.push_back(uv.value[1]);
+                }
+                gpu.overlayVertexBuffers.push_back(
+                    OverlayVertexBuffer{
+                        overlayID,
+                        0,
+                        std::move(overlayVertexData)});
+            }
         }
-        gpu.textureResource = imageryTiles
-            ? acquireImageTexture((*imageryTiles)[region])
-            : createFallbackTexture(tile);
-        gpu.texture = gpu.textureResource ? gpu.textureResource->id : 0;
+        gpu.cpuIndexData = cpuIndices;
+        gpu.indexCount = static_cast<GLsizei>(cpuIndices.size());
+        gpu.indexType = GL_UNSIGNED_INT;
         resources.bytes += gpu.cpuVertexData.size() * sizeof(float);
         resources.bytes += gpu.cpuIndexData.size() * sizeof(uint32_t);
         resources.primitives.push_back(gpu);
@@ -420,89 +1028,104 @@ void MinimalPrepareRendererResources::uploadIndexBuffer(
     gpu.cpuIndexData = data;
 }
 
-std::shared_ptr<GpuTexture> MinimalPrepareRendererResources::acquireImageTexture(
-    const ImageryTileResource& imagery) {
-    const std::string key = imageryTextureKey(imagery);
-    auto& cache = imageryTextureCache();
-    const auto found = cache.find(key);
-    if (found != cache.end()) {
-        if (std::shared_ptr<GpuTexture> texture = found->second.lock()) {
-            return texture;
-        }
-        cache.erase(found);
+void MinimalPrepareRendererResources::uploadPrimitiveBuffers(GpuPrimitive& gpu) {
+    if (gpu.buffersUploaded) return;
+    if (gpu.indexBuffer == 0 && !gpu.cpuIndexData.empty()) {
+        uploadIndexBuffer(gpu.cpuIndexData, gpu);
     }
-
-    const ImageRgba& satellite = *imagery.image;
-    GLuint texture = 0;
-    glGenTextures(1, &texture);
-    glBindTexture(GL_TEXTURE_2D, texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(
-        GL_TEXTURE_2D,
-        0,
-        GL_RGBA,
-        satellite.width,
-        satellite.height,
-        0,
-        GL_RGBA,
-        GL_UNSIGNED_BYTE,
-        satellite.pixels.data());
-    glBindTexture(GL_TEXTURE_2D, 0);
-    auto resource = makeTextureResource(
-        texture,
-        static_cast<size_t>(satellite.width) * static_cast<size_t>(satellite.height) * 4);
-    cache[key] = resource;
-    return resource;
+    if (gpu.vertexBuffer == 0 && !gpu.cpuVertexData.empty()) {
+        gpu.vertexBuffer = uploadVertexBuffer(gpu.cpuVertexData);
+    }
+    for (OverlayVertexBuffer& overlay : gpu.overlayVertexBuffers) {
+        if (overlay.vertexBuffer != 0) continue;
+        if (overlay.cpuVertexData == gpu.cpuVertexData) {
+            overlay.vertexBuffer = gpu.vertexBuffer;
+        } else if (!overlay.cpuVertexData.empty()) {
+            overlay.vertexBuffer = uploadVertexBuffer(overlay.cpuVertexData);
+        }
+    }
 }
 
-std::shared_ptr<GpuTexture> MinimalPrepareRendererResources::createFallbackTexture(
-    const Cesium3DTilesSelection::Tile& tile) {
-    uint32_t level = 0;
-    uint32_t x = 0;
-    uint32_t y = 0;
-    if (const auto* id = std::get_if<CesiumGeometry::QuadtreeTileID>(&tile.getTileID())) {
-        level = id->level;
-        x = id->x;
-        y = id->y;
-    }
+void MinimalPrepareRendererResources::queueGeometryUpload(GpuTileResources* resources) {
+    if (!resources || resources->queuedForUpload || resources->primitives.empty()) return;
+    resources->queuedForUpload = true;
+    std::lock_guard<std::mutex> lock(_uploadMutex);
+    _pendingGeometryUploads.push_back(resources);
+}
 
-    const uint8_t r = static_cast<uint8_t>(levelColor(level, 0) * 255.0f);
-    const uint8_t g = static_cast<uint8_t>(levelColor(level + x, 1) * 255.0f);
-    const uint8_t b = static_cast<uint8_t>(levelColor(level + y, 2) * 255.0f);
-    std::array<uint8_t, 8 * 8 * 4> pixels{};
-    for (size_t row = 0; row < 8; ++row) {
-        for (size_t col = 0; col < 8; ++col) {
-            const bool bright = ((row / 2 + col / 2) % 2) == 0;
-            const size_t offset = (row * 8 + col) * 4;
-            pixels[offset] = bright ? r : static_cast<uint8_t>(r * 0.55f);
-            pixels[offset + 1] = bright ? g : static_cast<uint8_t>(g * 0.55f);
-            pixels[offset + 2] = bright ? b : static_cast<uint8_t>(b * 0.55f);
-            pixels[offset + 3] = 255;
+void MinimalPrepareRendererResources::removeGeometryUpload(GpuTileResources* resources) noexcept {
+    if (!resources) return;
+    std::lock_guard<std::mutex> lock(_uploadMutex);
+    _pendingGeometryUploads.erase(
+        std::remove(_pendingGeometryUploads.begin(), _pendingGeometryUploads.end(), resources),
+        _pendingGeometryUploads.end());
+    resources->queuedForUpload = false;
+}
+
+void MinimalPrepareRendererResources::removePendingRasterAttachments(GpuTileResources* resources) noexcept {
+    if (!resources) return;
+    std::lock_guard<std::mutex> lock(_uploadMutex);
+    for (void* rawRaster : _pendingRasterUploads) {
+        auto* raster = reinterpret_cast<RasterTextureResource*>(rawRaster);
+        if (!raster) continue;
+        raster->pendingAttachments.erase(
+            std::remove_if(
+                raster->pendingAttachments.begin(),
+                raster->pendingAttachments.end(),
+                [resources](const RasterTextureResource::PendingAttachment& pending) {
+                    return pending.resources == resources;
+                }),
+            raster->pendingAttachments.end());
+    }
+}
+
+void MinimalPrepareRendererResources::queueRasterUpload(void* resource) {
+    auto* raster = reinterpret_cast<RasterTextureResource*>(resource);
+    if (!raster || raster->queuedForUpload || raster->textureResource) return;
+    raster->queuedForUpload = true;
+    std::lock_guard<std::mutex> lock(_uploadMutex);
+    _pendingRasterUploads.push_back(resource);
+}
+
+void MinimalPrepareRendererResources::removeRasterUpload(void* resource) noexcept {
+    if (!resource) return;
+    auto* raster = reinterpret_cast<RasterTextureResource*>(resource);
+    std::lock_guard<std::mutex> lock(_uploadMutex);
+    _pendingRasterUploads.erase(
+        std::remove(_pendingRasterUploads.begin(), _pendingRasterUploads.end(), resource),
+        _pendingRasterUploads.end());
+    raster->queuedForUpload = false;
+}
+
+GLuint MinimalPrepareRendererResources::acquireReusableTexture(int32_t width, int32_t height) {
+    auto it = std::find_if(
+        _reusableTextures.begin(),
+        _reusableTextures.end(),
+        [width, height](const ReusableTexture& texture) {
+            return texture.width == width && texture.height == height && texture.id != 0;
+        });
+    if (it == _reusableTextures.end()) return 0;
+    const GLuint texture = it->id;
+    _reusableTextures.erase(it);
+    return texture;
+}
+
+void MinimalPrepareRendererResources::cacheReusableTexture(
+    GLuint texture,
+    int32_t width,
+    int32_t height,
+    size_t bytes) noexcept {
+    if (texture == 0 || width <= 0 || height <= 0) return;
+    std::lock_guard<std::mutex> lock(_uploadMutex);
+    constexpr size_t maxReusableTextures = 64;
+    if (_reusableTextures.size() >= maxReusableTextures) {
+        GLuint evicted = _reusableTextures.front().id;
+        _reusableTextures.erase(_reusableTextures.begin());
+        if (evicted != 0) {
+            glDeleteTextures(1, &evicted);
         }
     }
-
-    GLuint texture = 0;
-    glGenTextures(1, &texture);
-    glBindTexture(GL_TEXTURE_2D, texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(
-        GL_TEXTURE_2D,
-        0,
-        GL_RGBA,
-        8,
-        8,
-        0,
-        GL_RGBA,
-        GL_UNSIGNED_BYTE,
-        pixels.data());
-    glBindTexture(GL_TEXTURE_2D, 0);
-    return makeTextureResource(texture, 8 * 8 * 4);
+    _reusableTextures.push_back(ReusableTexture{texture, width, height, bytes});
 }
 
 } // namespace cesium_poc

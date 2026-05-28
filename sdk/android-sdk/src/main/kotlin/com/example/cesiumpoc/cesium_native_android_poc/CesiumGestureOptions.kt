@@ -10,6 +10,6 @@ data class CesiumGestureOptions(
     val panEnabled: Boolean = true,
     val zoomEnabled: Boolean = true,
     val rotateEnabled: Boolean = false,
-    val tiltEnabled: Boolean = false,
-    val inertiaEnabled: Boolean = false,
+    val tiltEnabled: Boolean = true,
+    val inertiaEnabled: Boolean = true,
 )

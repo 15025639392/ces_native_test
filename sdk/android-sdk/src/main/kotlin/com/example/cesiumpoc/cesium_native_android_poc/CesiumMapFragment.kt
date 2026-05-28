@@ -19,6 +19,7 @@ class CesiumMapFragment : Fragment() {
     private var pendingInteractionEnabled: Boolean = true
     private var pendingGestureOptions: CesiumGestureOptions = CesiumGestureOptions()
     private var pendingPerformanceOptions: CesiumPerformanceOptions = CesiumPerformanceOptions()
+    private var pendingImagerySource: ImagerySource? = null
     val controller: CesiumMapController = CesiumMapFragmentController(this)
 
     val cameraState: CesiumCameraState?
@@ -29,6 +30,8 @@ class CesiumMapFragment : Fragment() {
         get() = mapView?.gestureOptions ?: pendingGestureOptions
     val performanceOptions: CesiumPerformanceOptions
         get() = mapView?.performanceOptions ?: pendingPerformanceOptions
+    val imagerySource: ImagerySource?
+        get() = mapView?.imagerySource ?: pendingImagerySource
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -47,6 +50,7 @@ class CesiumMapFragment : Fragment() {
         view.interactionEnabled = pendingInteractionEnabled
         view.gestureOptions = pendingGestureOptions
         view.performanceOptions = pendingPerformanceOptions
+        view.imagerySource = pendingImagerySource
         pendingCamera?.let(view::setCamera)
         return view
     }
@@ -107,6 +111,11 @@ class CesiumMapFragment : Fragment() {
         mapView?.performanceOptions = options
     }
 
+    fun setImagerySource(source: ImagerySource?) {
+        pendingImagerySource = source
+        mapView?.imagerySource = source
+    }
+
     fun clearMemory() {
         mapView?.clearMemory()
     }
@@ -118,7 +127,7 @@ class CesiumMapFragment : Fragment() {
     companion object {
         private const val ARG_LONGITUDE = "longitude"
         private const val ARG_LATITUDE = "latitude"
-        private const val ARG_ZOOM = "zoom"
+        private const val ARG_ALTITUDE_METERS = "altitudeMeters"
         private const val ARG_AUTO_ORBIT = "autoOrbit"
         private const val ARG_BEARING = "bearing"
         private const val ARG_PITCH = "pitch"
@@ -129,7 +138,7 @@ class CesiumMapFragment : Fragment() {
                     initialCamera?.let {
                         putDouble(ARG_LONGITUDE, it.longitude)
                         putDouble(ARG_LATITUDE, it.latitude)
-                        putDouble(ARG_ZOOM, it.zoom)
+                        putDouble(ARG_ALTITUDE_METERS, it.altitudeMeters)
                         putBoolean(ARG_AUTO_ORBIT, it.autoOrbit)
                         putDouble(ARG_BEARING, it.bearing)
                         putDouble(ARG_PITCH, it.pitch)
@@ -143,7 +152,7 @@ class CesiumMapFragment : Fragment() {
             return CesiumCameraState(
                 longitude = getDouble(ARG_LONGITUDE),
                 latitude = getDouble(ARG_LATITUDE),
-                zoom = getDouble(ARG_ZOOM),
+                altitudeMeters = getDouble(ARG_ALTITUDE_METERS),
                 autoOrbit = getBoolean(ARG_AUTO_ORBIT, false),
                 bearing = getDouble(ARG_BEARING, 0.0),
                 pitch = getDouble(ARG_PITCH, 0.0),

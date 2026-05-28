@@ -6,9 +6,9 @@ add_library(
     cesium_bridge
     SHARED
         cesium_bridge.cpp
-        batch_renderer.cpp
+        curl_asset_accessor.cpp
         gl_resources.cpp
-        imagery.cpp
+        imagery_source_config.cpp
         prepare_renderer_resources.cpp
 )
 
@@ -48,7 +48,14 @@ find_library(gles_lib GLESv3)
 find_package(cesium-native CONFIG REQUIRED)
 find_package(CURL CONFIG REQUIRED)
 
-target_compile_definitions(cesium_bridge PRIVATE CESIUM_NATIVE_LINKED=1)
+target_compile_definitions(
+    cesium_bridge
+    PRIVATE
+        CESIUM_NATIVE_LINKED=1
+        # The configured Android Cesium Native package is built with release
+        # headers/libraries. Keep this target ABI-compatible with that package.
+        NDEBUG
+)
 
 target_link_libraries(
     cesium_bridge
@@ -58,4 +65,5 @@ target_link_libraries(
         CURL::libcurl
         CesiumGeospatial
         Cesium3DTilesSelection
+        CesiumRasterOverlays
 )

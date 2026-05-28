@@ -9,10 +9,11 @@ class CesiumMapFragmentController(
 ) : CesiumMapController {
     override var cameraState: CesiumCameraState
         get() = fragment.cameraState ?: CesiumCameraState(
-            longitude = 116.397389,
-            latitude = 39.908722,
-            zoom = 15.0,
+            longitude = 104.0,
+            latitude = 35.0,
+            altitudeMeters = 3_535_534.0,
             autoOrbit = false,
+            pitch = 35.0,
         )
         set(value) {
             fragment.setCamera(value)
@@ -34,6 +35,12 @@ class CesiumMapFragmentController(
         get() = fragment.performanceOptions
         set(value) {
             fragment.setPerformanceOptions(value)
+        }
+
+    override var imagerySource: ImagerySource?
+        get() = fragment.imagerySource
+        set(value) {
+            fragment.setImagerySource(value)
         }
 
     override fun clearMemory() {

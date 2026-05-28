@@ -4,6 +4,7 @@ import 'cesium_camera_state.dart';
 import 'cesium_gesture_options.dart';
 import 'cesium_performance_options.dart';
 import 'cesium_render_stats.dart';
+import 'imagery_source.dart';
 
 abstract class CesiumMapController {
   Future<void> setCamera(CesiumCameraState camera);
@@ -21,6 +22,10 @@ abstract class CesiumMapController {
   Future<void> setGestureOptions(CesiumGestureOptions options);
 
   Future<void> setPerformanceOptions(CesiumPerformanceOptions options);
+
+  Future<ImagerySource?> getImagerySource();
+
+  Future<void> setImagerySource(ImagerySource? source);
 
   Future<void> clearMemory();
 
@@ -84,6 +89,18 @@ class MethodChannelCesiumMapController implements CesiumMapController {
   @override
   Future<void> setPerformanceOptions(CesiumPerformanceOptions options) async {
     await channel.invokeMethod<void>('setPerformanceOptions', options.toMap());
+  }
+
+  @override
+  Future<ImagerySource?> getImagerySource() async {
+    final data =
+        await channel.invokeMethod<Map<Object?, Object?>>('getImagerySource');
+    return ImagerySource.fromMap(data);
+  }
+
+  @override
+  Future<void> setImagerySource(ImagerySource? source) async {
+    await channel.invokeMethod<void>('setImagerySource', source?.toMap());
   }
 
   @override

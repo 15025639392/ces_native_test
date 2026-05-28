@@ -1,16 +1,16 @@
 package com.example.cesiumpoc.cesium_native_android_poc
 
 /**
- * V1 camera contract shared by Android hosts and the Flutter bridge.
+ * WGS84 camera contract shared by Android hosts and the Flutter bridge.
  *
- * The current native renderer still mainly consumes lon/lat/zoom plus a
- * simple orbit flag. `bearing` and `pitch` are included now so the SDK can
- * evolve toward a fuller camera model without another contract break.
+ * `altitudeMeters` is height above the WGS84 ellipsoid. Tile selection and
+ * raster overlay management remain inside cesium-native; the host only passes
+ * camera state into the renderer backend.
  */
 data class CesiumCameraState(
     val longitude: Double,
     val latitude: Double,
-    val zoom: Double,
+    val altitudeMeters: Double,
     val autoOrbit: Boolean,
     val bearing: Double = 0.0,
     val pitch: Double = 0.0,

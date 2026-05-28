@@ -13,13 +13,6 @@ class CesiumMapSdkPlugin : FlutterPlugin {
                 CesiumMapConstants.VIEW_TYPE,
             ),
         )
-        binding.platformViewRegistry.registerViewFactory(
-            CesiumMapConstants.LEGACY_VIEW_TYPE,
-            CesiumMapViewFactory(
-                binding.binaryMessenger,
-                CesiumMapConstants.LEGACY_VIEW_TYPE,
-            ),
-        )
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) = Unit

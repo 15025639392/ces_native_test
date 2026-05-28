@@ -5,6 +5,6 @@
 namespace cesium_poc {
 
 GLuint createProgram();
-GLuint createBatchProgram();
+GLuint createTextureArrayProgram();
 
 } // namespace cesium_poc

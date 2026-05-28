@@ -7,6 +7,8 @@ import com.example.cesiumpoc.cesium_native_android_poc.CesiumGestureOptions
 import com.example.cesiumpoc.cesium_native_android_poc.CesiumMapView
 import com.example.cesiumpoc.cesium_native_android_poc.CesiumPerformanceOptions
 import com.example.cesiumpoc.cesium_native_android_poc.CesiumRenderStats
+import com.example.cesiumpoc.cesium_native_android_poc.ImagerySource
+import com.example.cesiumpoc.cesium_native_android_poc.UrlTemplateImagerySource
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -26,17 +28,18 @@ internal class CesiumMapPlatformView(
         channel.setMethodCallHandler(this)
         mapView.setCamera(
             CesiumCameraState(
-                longitude = params.doubleValue("longitude", 116.397389),
-                latitude = params.doubleValue("latitude", 39.908722),
-                zoom = params.doubleValue("zoom", 15.0),
+                longitude = params.doubleValue("longitude", 104.0),
+                latitude = params.doubleValue("latitude", 35.0),
+                altitudeMeters = params.doubleValue("altitudeMeters", 3_535_534.0),
                 autoOrbit = params.boolValue("autoOrbit", false),
                 bearing = params.doubleValue("bearing", 0.0),
-                pitch = params.doubleValue("pitch", 0.0),
+                pitch = params.doubleValue("pitch", 35.0),
             ),
         )
         mapView.interactionEnabled = params.boolValue("interactionEnabled", true)
         mapView.gestureOptions = params.toGestureOptions()
         mapView.performanceOptions = params.toPerformanceOptions()
+        mapView.imagerySource = params.toImagerySource()
         mapView.onStats = { channel.invokeMethod("stats", it.toMap()) }
         mapView.onMapReady = { channel.invokeMethod("mapReady", null) }
         mapView.onCameraMoveStarted = { channel.invokeMethod("cameraMoveStarted", it.toMap()) }
@@ -71,7 +74,7 @@ internal class CesiumMapPlatformView(
                         CesiumCameraState(
                             longitude = args.doubleValue("longitude", currentCamera.longitude),
                             latitude = args.doubleValue("latitude", currentCamera.latitude),
-                            zoom = args.doubleValue("zoom", currentCamera.zoom),
+                            altitudeMeters = args.doubleValue("altitudeMeters", currentCamera.altitudeMeters),
                             autoOrbit = args.boolValue("autoOrbit", currentCamera.autoOrbit),
                             bearing = args.doubleValue("bearing", currentCamera.bearing),
                             pitch = args.doubleValue("pitch", currentCamera.pitch),
@@ -91,6 +94,9 @@ internal class CesiumMapPlatformView(
                 "getPerformanceOptions" -> {
                     result.success(mapView.performanceOptions.toMap())
                 }
+                "getImagerySource" -> {
+                    result.success(mapView.imagerySource?.toMap())
+                }
                 "clearMemory" -> {
                     mapView.clearMemory()
                     result.success(null)
@@ -107,6 +113,11 @@ internal class CesiumMapPlatformView(
                 "setPerformanceOptions" -> {
                     val args = call.arguments as? Map<*, *> ?: emptyMap<Any, Any>()
                     mapView.performanceOptions = args.toPerformanceOptions()
+                    result.success(null)
+                }
+                "setImagerySource" -> {
+                    val args = call.arguments as? Map<*, *>
+                    mapView.imagerySource = args?.toImagerySource()
                     result.success(null)
                 }
                 "getStats" -> {
@@ -138,8 +149,8 @@ private fun Map<*, *>.toGestureOptions(): CesiumGestureOptions {
         panEnabled = boolValue("panEnabled", true),
         zoomEnabled = boolValue("zoomEnabled", true),
         rotateEnabled = boolValue("rotateEnabled", false),
-        tiltEnabled = boolValue("tiltEnabled", false),
-        inertiaEnabled = boolValue("inertiaEnabled", false),
+        tiltEnabled = boolValue("tiltEnabled", true),
+        inertiaEnabled = boolValue("inertiaEnabled", true),
     )
 }
 
@@ -155,11 +166,21 @@ private fun Map<*, *>.toPerformanceOptions(): CesiumPerformanceOptions {
     )
 }
 
+private fun Map<*, *>.toImagerySource(): ImagerySource? {
+    return when (this["type"] as? String) {
+        "urlTemplate" -> UrlTemplateImagerySource(
+            id = this["id"] as? String ?: "",
+            urlTemplate = this["urlTemplate"] as? String ?: "",
+        )
+        else -> null
+    }
+}
+
 private fun CesiumCameraState.toMap(): Map<String, Any> {
     return mapOf(
         "longitude" to longitude,
         "latitude" to latitude,
-        "zoom" to zoom,
+        "altitudeMeters" to altitudeMeters,
         "autoOrbit" to autoOrbit,
         "bearing" to bearing,
         "pitch" to pitch,
@@ -182,6 +203,16 @@ private fun CesiumPerformanceOptions.toMap(): Map<String, Any> {
         movementMaximumScreenSpaceError?.let {
             put("movementMaximumScreenSpaceError", it)
         }
+    }
+}
+
+private fun ImagerySource.toMap(): Map<String, Any?> {
+    return when (this) {
+        is UrlTemplateImagerySource -> mapOf(
+            "type" to "urlTemplate",
+            "id" to id,
+            "urlTemplate" to urlTemplate,
+        )
     }
 }
 

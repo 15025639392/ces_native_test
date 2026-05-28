@@ -10,6 +10,7 @@ import 'cesium_map_controller.dart';
 import 'cesium_map_error.dart';
 import 'cesium_performance_options.dart';
 import 'cesium_render_stats.dart';
+import 'imagery_source.dart';
 
 const _cesiumMapViewType = 'cesium_map_view';
 
@@ -17,14 +18,16 @@ class CesiumMapWidget extends StatefulWidget {
   const CesiumMapWidget({
     super.key,
     this.initialCamera = const CesiumCameraState(
-      longitude: 116.397389,
-      latitude: 39.908722,
-      zoom: 15,
+      longitude: 104.0,
+      latitude: 35.0,
+      altitudeMeters: 3535534.0,
       autoOrbit: false,
+      pitch: 35.0,
     ),
     this.interactionEnabled = true,
     this.gestureOptions = const CesiumGestureOptions(),
     this.performanceOptions = const CesiumPerformanceOptions(),
+    this.imagerySource,
     this.onMapCreated,
     this.onMapReady,
     this.onCameraMoveStarted,
@@ -39,6 +42,7 @@ class CesiumMapWidget extends StatefulWidget {
   final bool interactionEnabled;
   final CesiumGestureOptions gestureOptions;
   final CesiumPerformanceOptions performanceOptions;
+  final ImagerySource? imagerySource;
   final ValueChanged<CesiumMapController>? onMapCreated;
   final VoidCallback? onMapReady;
   final ValueChanged<CesiumCameraState>? onCameraMoveStarted;
@@ -87,6 +91,7 @@ class _CesiumMapWidgetState extends State<CesiumMapWidget> {
     await controller.setInteractionEnabled(widget.interactionEnabled);
     await controller.setGestureOptions(widget.gestureOptions);
     await controller.setPerformanceOptions(widget.performanceOptions);
+    await controller.setImagerySource(widget.imagerySource);
     await controller.setCamera(widget.initialCamera);
   }
 
@@ -105,6 +110,7 @@ class _CesiumMapWidgetState extends State<CesiumMapWidget> {
         'interactionEnabled': widget.interactionEnabled,
         ...widget.gestureOptions.toMap(),
         ...widget.performanceOptions.toMap(),
+        ...?widget.imagerySource?.toMap(),
       },
       creationParamsCodec: const StandardMessageCodec(),
     );

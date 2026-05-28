@@ -12,18 +12,76 @@ internal class NativeCesiumBridge {
     fun updateCamera(
         longitude: Double,
         latitude: Double,
-        zoom: Double,
+        altitudeMeters: Double,
         autoOrbit: Boolean,
         bearing: Double,
         pitch: Double,
-    ) {
+    ): CesiumCameraState {
+        if (nativeHandle == 0L) return cameraState()
+        nativeUpdateCamera(nativeHandle, longitude, latitude, altitudeMeters, autoOrbit, bearing, pitch)
+        return cameraState()
+    }
+
+    fun cameraState(): CesiumCameraState {
+        if (nativeHandle == 0L) {
+            return CesiumCameraState(104.0, 35.0, 3_535_534.0, false, pitch = 35.0)
+        }
+        return nativeCameraState(nativeHandle).toCameraState()
+    }
+
+    fun panCamera(
+        currentX: Double,
+        currentY: Double,
+        distanceX: Double,
+        distanceY: Double,
+        sensitivity: Double,
+    ): CesiumCameraState {
+        if (nativeHandle == 0L) return cameraState()
+        return nativePanCamera(nativeHandle, currentX, currentY, distanceX, distanceY, sensitivity).toCameraState()
+    }
+
+    fun scaleCamera(
+        scale: Double,
+        focusX: Double,
+        focusY: Double,
+    ): CesiumCameraState {
+        if (nativeHandle == 0L) return cameraState()
+        return nativeScaleCamera(nativeHandle, scale, focusX, focusY).toCameraState()
+    }
+
+    fun scaleCameraFromCenter(scale: Double): CesiumCameraState {
+        if (nativeHandle == 0L) return cameraState()
+        return nativeScaleCameraFromCenter(nativeHandle, scale).toCameraState()
+    }
+
+    fun rotateCamera(bearingDeltaDegrees: Double, focusX: Double, focusY: Double): CesiumCameraState {
+        if (nativeHandle == 0L) return cameraState()
+        return nativeRotateCamera(nativeHandle, bearingDeltaDegrees, focusX, focusY).toCameraState()
+    }
+
+    fun tiltCamera(pitchDeltaDegrees: Double, focusX: Double, focusY: Double): CesiumCameraState {
+        if (nativeHandle == 0L) return cameraState()
+        return nativeTiltCamera(nativeHandle, pitchDeltaDegrees, focusX, focusY).toCameraState()
+    }
+
+    fun orbitCamera(deltaSeconds: Double, degreesPerSecond: Double): CesiumCameraState {
+        if (nativeHandle == 0L) return cameraState()
+        return nativeOrbitCamera(nativeHandle, deltaSeconds, degreesPerSecond).toCameraState()
+    }
+
+    fun setCameraMoving(moving: Boolean) {
         if (nativeHandle == 0L) return
-        nativeUpdateCamera(nativeHandle, longitude, latitude, zoom, autoOrbit, bearing, pitch)
+        nativeSetCameraMoving(nativeHandle, moving)
     }
 
     fun setMaximumScreenSpaceError(maximumScreenSpaceError: Double) {
         if (nativeHandle == 0L) return
         nativeSetMaximumScreenSpaceError(nativeHandle, maximumScreenSpaceError)
+    }
+
+    fun setImageryUrlTemplate(urlTemplate: String?) {
+        if (nativeHandle == 0L) return
+        nativeSetImageryUrlTemplate(nativeHandle, urlTemplate)
     }
 
     fun onSurfaceCreated() {
@@ -85,16 +143,51 @@ internal class NativeCesiumBridge {
         handle: Long,
         longitude: Double,
         latitude: Double,
-        zoom: Double,
+        altitudeMeters: Double,
         autoOrbit: Boolean,
         bearing: Double,
         pitch: Double,
     )
+    private external fun nativeCameraState(handle: Long): DoubleArray
+    private external fun nativePanCamera(
+        handle: Long,
+        currentX: Double,
+        currentY: Double,
+        distanceX: Double,
+        distanceY: Double,
+        sensitivity: Double,
+    ): DoubleArray
+    private external fun nativeScaleCamera(
+        handle: Long,
+        scale: Double,
+        focusX: Double,
+        focusY: Double,
+    ): DoubleArray
+    private external fun nativeScaleCameraFromCenter(handle: Long, scale: Double): DoubleArray
+    private external fun nativeRotateCamera(
+        handle: Long,
+        bearingDeltaDegrees: Double,
+        focusX: Double,
+        focusY: Double,
+    ): DoubleArray
+    private external fun nativeTiltCamera(
+        handle: Long,
+        pitchDeltaDegrees: Double,
+        focusX: Double,
+        focusY: Double,
+    ): DoubleArray
+    private external fun nativeOrbitCamera(
+        handle: Long,
+        deltaSeconds: Double,
+        degreesPerSecond: Double,
+    ): DoubleArray
+    private external fun nativeSetCameraMoving(handle: Long, moving: Boolean)
     private external fun nativeOnSurfaceCreated(handle: Long)
     private external fun nativeOnSurfaceChanged(handle: Long, width: Int, height: Int)
     private external fun nativeRenderFrame(handle: Long, width: Int, height: Int, deltaSeconds: Double)
     private external fun nativeRecommendedFrameIntervalNanos(handle: Long): Long
     private external fun nativeSetMaximumScreenSpaceError(handle: Long, maximumScreenSpaceError: Double)
+    private external fun nativeSetImageryUrlTemplate(handle: Long, urlTemplate: String?)
     private external fun nativeClearMemory(handle: Long)
     private external fun nativeIsCesiumNativeLinked(): Boolean
     private external fun nativeBackendName(): String
@@ -114,6 +207,17 @@ internal class NativeCesiumBridge {
             System.loadLibrary("cesium_bridge")
         }
     }
+}
+
+private fun DoubleArray.toCameraState(): CesiumCameraState {
+    return CesiumCameraState(
+        longitude = getOrElse(0) { 104.0 },
+        latitude = getOrElse(1) { 35.0 },
+        altitudeMeters = getOrElse(2) { 3_535_534.0 },
+        autoOrbit = getOrElse(3) { 0.0 } != 0.0,
+        bearing = getOrElse(4) { 0.0 },
+        pitch = getOrElse(5) { 35.0 },
+    )
 }
 
 internal data class CesiumBridgeStats(
