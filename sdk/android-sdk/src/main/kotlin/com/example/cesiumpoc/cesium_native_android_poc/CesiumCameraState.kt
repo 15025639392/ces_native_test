@@ -3,9 +3,10 @@ package com.example.cesiumpoc.cesium_native_android_poc
 /**
  * WGS84 camera contract shared by Android hosts and the Flutter bridge.
  *
- * `altitudeMeters` is height above the WGS84 ellipsoid. Tile selection and
- * raster overlay management remain inside cesium-native; the host only passes
- * camera state into the renderer backend.
+ * `longitude` and `latitude` are the WGS84 view target. `altitudeMeters` is
+ * the camera range from that target in meters. Tile selection and raster
+ * overlay management remain inside cesium-native; the host only passes camera
+ * state into the renderer backend.
  */
 data class CesiumCameraState(
     val longitude: Double,

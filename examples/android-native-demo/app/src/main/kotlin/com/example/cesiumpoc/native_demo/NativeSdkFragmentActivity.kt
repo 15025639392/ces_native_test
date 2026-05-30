@@ -18,16 +18,30 @@ import com.example.cesiumpoc.cesium_native_android_poc.CesiumMapFragment
 import com.example.cesiumpoc.cesium_native_android_poc.CesiumMapListener
 import com.example.cesiumpoc.cesium_native_android_poc.CesiumPerformanceOptions
 import com.example.cesiumpoc.cesium_native_android_poc.CesiumRenderStats
+import com.example.cesiumpoc.cesium_native_android_poc.QuantizedMeshTerrainSource
+import com.example.cesiumpoc.cesium_native_android_poc.UrlTemplateImagerySource
 
 class NativeSdkFragmentActivity : FragmentActivity() {
+    private val imagerySource =
+        UrlTemplateImagerySource(
+            id = "osm",
+            urlTemplate = "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        )
+    private val terrainSource =
+        QuantizedMeshTerrainSource(
+            id = "swisstopo_terrain",
+            layerJsonUrl = "https://3d.geo.admin.ch/ch.swisstopo.terrain.3d/v1/20250101/layer.json",
+        )
+
     private val fragment =
         CesiumMapFragment.newInstance(
             CesiumCameraState(
-                longitude = 104.0,
-                latitude = 35.0,
-                altitudeMeters = 3_535_534.0,
+                longitude = 7.75,
+                latitude = 46.02,
+                altitudeMeters = 80_000.0,
                 autoOrbit = false,
-                pitch = 35.0,
+                bearing = 25.0,
+                pitch = 55.0,
             ),
         )
 
@@ -50,6 +64,8 @@ class NativeSdkFragmentActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(buildContentView())
+        fragment.controller.imagerySource = imagerySource
+        fragment.controller.terrainSource = terrainSource
 
         fragment.setListener(
             object : CesiumMapListener {
@@ -143,7 +159,7 @@ class NativeSdkFragmentActivity : FragmentActivity() {
     }
 
     private fun renderPerformance() {
-        performanceView.text = "detail  mse ${maximumScreenSpaceError.format(1)}"
+        performanceView.text = "detail  mse ${maximumScreenSpaceError.format(1)}  terrain ${terrainSource.id}"
     }
 
     private fun metricText(text: String): TextView {

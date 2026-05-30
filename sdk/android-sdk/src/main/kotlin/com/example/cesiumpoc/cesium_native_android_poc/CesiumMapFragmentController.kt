@@ -13,7 +13,7 @@ class CesiumMapFragmentController(
             latitude = 35.0,
             altitudeMeters = 3_535_534.0,
             autoOrbit = false,
-            pitch = 35.0,
+            pitch = 0.0,
         )
         set(value) {
             fragment.setCamera(value)
@@ -41,6 +41,12 @@ class CesiumMapFragmentController(
         get() = fragment.imagerySource
         set(value) {
             fragment.setImagerySource(value)
+        }
+
+    override var terrainSource: TerrainSource?
+        get() = fragment.terrainSource
+        set(value) {
+            fragment.setTerrainSource(value)
         }
 
     override fun clearMemory() {

@@ -9,14 +9,10 @@ package com.example.cesiumpoc.cesium_native_android_poc
  */
 data class CesiumPerformanceOptions(
     val maximumScreenSpaceError: Double = 4.0,
-    val movementMaximumScreenSpaceError: Double? = 8.0,
 ) {
     init {
         require(maximumScreenSpaceError > 0.0) {
             "maximumScreenSpaceError must be > 0.0"
-        }
-        require(movementMaximumScreenSpaceError == null || movementMaximumScreenSpaceError > 0.0) {
-            "movementMaximumScreenSpaceError must be null or > 0.0"
         }
     }
 }

@@ -35,16 +35,20 @@ class CesiumMapDemoPage extends StatefulWidget {
 
 class _CesiumMapDemoPageState extends State<CesiumMapDemoPage> {
   static const ImagerySource _imagerySource = UrlTemplateImagerySource(
-    id: 'gaode_satellite',
-    urlTemplate:
-        'http://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}',
+    id: 'osm',
+    urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+  );
+  static const TerrainSource _terrainSource = QuantizedMeshTerrainSource(
+    id: 'swisstopo_terrain',
+    layerJsonUrl:
+        'https://3d.geo.admin.ch/ch.swisstopo.terrain.3d/v1/20250101/layer.json',
   );
 
-  double _longitude = 104.0;
-  double _latitude = 35.0;
-  double _altitudeMeters = 3535534.0;
-  double _bearing = 0;
-  double _pitch = 35;
+  double _longitude = 7.75;
+  double _latitude = 46.02;
+  double _altitudeMeters = 80000.0;
+  double _bearing = 25;
+  double _pitch = 55;
   bool _autoOrbit = false;
   bool _mapReady = false;
   String? _lastErrorMessage;
@@ -69,6 +73,7 @@ class _CesiumMapDemoPageState extends State<CesiumMapDemoPage> {
               child: CesiumMapWidget(
                 initialCamera: _camera,
                 imagerySource: _imagerySource,
+                terrainSource: _terrainSource,
                 onMapReady: () {
                   if (!mounted) return;
                   setState(() {
@@ -163,6 +168,7 @@ class _StatsBar extends StatelessWidget {
               value: stats.cesiumLinked ? 'linked' : stats.cesiumBackend,
             ),
             _Metric(label: 'ready', value: mapReady ? 'yes' : 'no'),
+            const _Metric(label: 'terrain', value: 'swisstopo'),
             if (errorMessage != null && errorMessage!.isNotEmpty)
               _Metric(label: 'error', value: errorMessage!),
           ],

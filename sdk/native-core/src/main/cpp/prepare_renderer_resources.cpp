@@ -5,16 +5,13 @@
 
 #include <Cesium3DTilesSelection/Tile.h>
 #include <Cesium3DTilesSelection/TileContent.h>
-#include <CesiumGeospatial/BoundingRegion.h>
-#include <CesiumGeospatial/Cartographic.h>
-#include <CesiumGeospatial/Ellipsoid.h>
-#include <CesiumGeospatial/GlobeRectangle.h>
-#include <CesiumGeometry/QuadtreeTileID.h>
 #include <CesiumGltf/AccessorView.h>
 #include <CesiumGltf/ImageAsset.h>
 #include <CesiumGltf/Mesh.h>
 #include <CesiumGltf/MeshPrimitive.h>
 #include <CesiumGltf/Model.h>
+#include <CesiumGltfContent/GltfUtilities.h>
+#include <CesiumGltfContent/SkirtMeshMetadata.h>
 #include <CesiumRasterOverlays/RasterOverlayTile.h>
 
 #include <glm/vec2.hpp>
@@ -230,47 +227,46 @@ CesiumAsync::Future<Cesium3DTilesSelection::TileLoadResultAndRenderResources>
 MinimalPrepareRendererResources::prepareInLoadThread(
     const CesiumAsync::AsyncSystem& asyncSystem,
     Cesium3DTilesSelection::TileLoadResult&& tileLoadResult,
-    const glm::dmat4&,
+    const glm::dmat4& transform,
     const std::any&) {
+    void* renderResources = nullptr;
+    if (const auto* model = std::get_if<CesiumGltf::Model>(&tileLoadResult.contentKind)) {
+        auto resources = std::make_unique<GpuTileResources>();
+        const glm::dmat4 rootTransform =
+            CesiumGltfContent::GltfUtilities::applyGltfUpAxisTransform(*model, transform);
+        model->forEachNodeInScene(
+            -1,
+            [resources = resources.get(), &rootTransform](
+                const CesiumGltf::Model& gltf,
+                const CesiumGltf::Node& node,
+                const glm::dmat4& nodeTransform) {
+                const CesiumGltf::Mesh* mesh =
+                    CesiumGltf::Model::getSafe(&gltf.meshes, node.mesh);
+                if (!mesh) return;
+
+                const glm::dmat4 primitiveTransform = rootTransform * nodeTransform;
+                for (const CesiumGltf::MeshPrimitive& primitive : mesh->primitives) {
+                    if (primitive.mode != CesiumGltf::MeshPrimitive::Mode::TRIANGLES) {
+                        continue;
+                    }
+                    appendPrimitive(gltf, primitive, primitiveTransform, *resources);
+                }
+            });
+        renderResources = resources.release();
+    }
     return asyncSystem.createResolvedFuture(
         Cesium3DTilesSelection::TileLoadResultAndRenderResources{
             std::move(tileLoadResult),
-            nullptr});
+            renderResources});
 }
 
 void* MinimalPrepareRendererResources::prepareInMainThread(
-    Cesium3DTilesSelection::Tile& tile,
+    Cesium3DTilesSelection::Tile&,
     void* pLoadThreadResult) {
-    delete reinterpret_cast<Marker*>(pLoadThreadResult);
-
-    const Cesium3DTilesSelection::TileRenderContent* renderContent =
-        tile.getContent().getRenderContent();
-    if (!renderContent) {
-        return new GpuTileResources();
+    auto* result = reinterpret_cast<GpuTileResources*>(pLoadThreadResult);
+    if (!result) {
+        result = new GpuTileResources();
     }
-
-    auto resources = std::make_unique<GpuTileResources>();
-    const CesiumGltf::Model& model = renderContent->getModel();
-    model.forEachNodeInScene(
-        -1,
-        [resources = resources.get(), &tile](
-            const CesiumGltf::Model& gltf,
-            const CesiumGltf::Node& node,
-            const glm::dmat4& nodeTransform) {
-            const CesiumGltf::Mesh* mesh =
-                CesiumGltf::Model::getSafe(&gltf.meshes, node.mesh);
-            if (!mesh) return;
-
-            const glm::dmat4 transform = tile.getTransform() * nodeTransform;
-            for (const CesiumGltf::MeshPrimitive& primitive : mesh->primitives) {
-                if (primitive.mode != CesiumGltf::MeshPrimitive::Mode::TRIANGLES) {
-                    continue;
-                }
-                appendPrimitive(gltf, primitive, transform, tile, *resources);
-            }
-        });
-
-    GpuTileResources* result = resources.release();
     queueGeometryUpload(result);
     return result;
 }
@@ -279,7 +275,7 @@ void MinimalPrepareRendererResources::free(
     Cesium3DTilesSelection::Tile&,
     void* pLoadThreadResult,
     void* pMainThreadResult) noexcept {
-    delete reinterpret_cast<Marker*>(pLoadThreadResult);
+    delete reinterpret_cast<GpuTileResources*>(pLoadThreadResult);
     auto* resources = reinterpret_cast<GpuTileResources*>(pMainThreadResult);
     removeGeometryUpload(resources);
     removePendingRasterAttachments(resources);
@@ -306,28 +302,33 @@ void* MinimalPrepareRendererResources::prepareRasterInLoadThread(
         image.channels != 4) {
         image.changeNumberOfChannels(4, std::byte{255});
     }
-    return new Marker();
+    if (image.width <= 0 ||
+        image.height <= 0 ||
+        image.bytesPerChannel != 1 ||
+        image.channels != 4 ||
+        image.pixelData.empty() ||
+        image.compressedPixelFormat != CesiumGltf::GpuCompressedPixelFormat::NONE) {
+        return nullptr;
+    }
+    auto* resource = new RasterTextureResource();
+    resource->width = image.width;
+    resource->height = image.height;
+    resource->bytes = static_cast<size_t>(image.width) * static_cast<size_t>(image.height) * 4;
+    resource->pixelData = image.pixelData;
+    return resource;
 }
 
 void* MinimalPrepareRendererResources::prepareRasterInMainThread(
     CesiumRasterOverlays::RasterOverlayTile& rasterTile,
     void* pLoadThreadResult) {
-    delete reinterpret_cast<Marker*>(pLoadThreadResult);
-    CesiumUtility::IntrusivePointer<const CesiumGltf::ImageAsset> image = rasterTile.getImage();
-    if (!image) return nullptr;
-    if (image->width <= 0 ||
-        image->height <= 0 ||
-        image->bytesPerChannel != 1 ||
-        image->channels != 4 ||
-        image->pixelData.empty() ||
-        image->compressedPixelFormat != CesiumGltf::GpuCompressedPixelFormat::NONE) {
+    (void)rasterTile;
+    auto* resource = reinterpret_cast<RasterTextureResource*>(pLoadThreadResult);
+    if (!resource ||
+        resource->width <= 0 ||
+        resource->height <= 0 ||
+        resource->pixelData.empty()) {
         return nullptr;
     }
-    auto* resource = new RasterTextureResource();
-    resource->width = image->width;
-    resource->height = image->height;
-    resource->bytes = static_cast<size_t>(image->width) * static_cast<size_t>(image->height) * 4;
-    resource->pixelData = image->pixelData;
     queueRasterUpload(resource);
     return resource;
 }
@@ -336,8 +337,10 @@ void MinimalPrepareRendererResources::freeRaster(
     const CesiumRasterOverlays::RasterOverlayTile&,
     void* pLoadThreadResult,
     void* pMainThreadResult) noexcept {
-    delete reinterpret_cast<Marker*>(pLoadThreadResult);
     auto* resource = reinterpret_cast<RasterTextureResource*>(pMainThreadResult);
+    if (!resource) {
+        resource = reinterpret_cast<RasterTextureResource*>(pLoadThreadResult);
+    }
     removeRasterUpload(resource);
     if (resource && resource->texture != 0) {
         glDeleteTextures(1, &resource->texture);
@@ -799,7 +802,6 @@ void MinimalPrepareRendererResources::appendPrimitive(
     const CesiumGltf::Model& model,
     const CesiumGltf::MeshPrimitive& primitive,
     const glm::dmat4& transform,
-    const Cesium3DTilesSelection::Tile&,
     GpuTileResources& resources) {
     static int logBudget = 12;
     int32_t positionAccessor = -1;
@@ -880,34 +882,33 @@ void MinimalPrepareRendererResources::appendPrimitive(
         }
         return;
     }
-    const size_t regionCount = 1;
-    std::vector<GpuPrimitive> gpuPrimitives(regionCount);
-    std::vector<std::vector<float>> vertexDataByRegion(regionCount);
-    for (std::vector<float>& vertexData : vertexDataByRegion) {
-        vertexData.reserve(static_cast<size_t>(positions.size()) * 5);
-    }
+    GpuPrimitive gpu;
+    std::vector<float> vertexData;
+    vertexData.reserve(static_cast<size_t>(positions.size()) * 5);
+
+    const std::optional<CesiumGltfContent::SkirtMeshMetadata> skirtMeshMetadata =
+        CesiumGltfContent::SkirtMeshMetadata::parseFromGltfExtras(primitive.extras);
+    const bool isQuantizedMeshTerrain = skirtMeshMetadata.has_value();
 
     bool hasOrigin = false;
     for (int64_t i = 0; i < positions.size(); ++i) {
         const auto& p = positions[i];
-        const glm::dvec3 ecef = glm::dvec3(transform * glm::dvec4(p.value[0], p.value[1], p.value[2], 1.0));
+        const glm::dvec3 localPosition(p.value[0], p.value[1], p.value[2]);
+        const glm::dvec3 ecef = isQuantizedMeshTerrain
+            ? skirtMeshMetadata->meshCenter + localPosition
+            : glm::dvec3(transform * glm::dvec4(localPosition, 1.0));
         if (!hasOrigin) {
-            for (GpuPrimitive& gpu : gpuPrimitives) {
-                gpu.originEcef = ecef;
-            }
+            gpu.originEcef = ecef;
             hasOrigin = true;
         }
-        const glm::dvec3 relative = ecef - gpuPrimitives.front().originEcef;
-        for (size_t region = 0; region < regionCount; ++region) {
-            std::vector<float>& vertexData = vertexDataByRegion[region];
-            vertexData.push_back(static_cast<float>(relative.x));
-            vertexData.push_back(static_cast<float>(relative.y));
-            vertexData.push_back(static_cast<float>(relative.z));
-            const auto& overlayUv = overlayUvs[i];
-            const glm::dvec2 uv(overlayUv.value[0], overlayUv.value[1]);
-            vertexData.push_back(static_cast<float>(uv.x));
-            vertexData.push_back(static_cast<float>(uv.y));
-        }
+        const glm::dvec3 relative = ecef - gpu.originEcef;
+        vertexData.push_back(static_cast<float>(relative.x));
+        vertexData.push_back(static_cast<float>(relative.y));
+        vertexData.push_back(static_cast<float>(relative.z));
+        const auto& overlayUv = overlayUvs[i];
+        const glm::dvec2 uv(overlayUv.value[0], overlayUv.value[1]);
+        vertexData.push_back(static_cast<float>(uv.x));
+        vertexData.push_back(static_cast<float>(uv.y));
     }
 
     std::vector<uint32_t> cpuIndices = readIndices(model, primitive);
@@ -922,56 +923,53 @@ void MinimalPrepareRendererResources::appendPrimitive(
         return;
     }
 
-    for (size_t region = 0; region < regionCount; ++region) {
-        GpuPrimitive& gpu = gpuPrimitives[region];
-        std::vector<float>& vertexData = vertexDataByRegion[region];
-
-        gpu.cpuVertexData = std::move(vertexData);
-        gpu.baseCpuVertexData = gpu.cpuVertexData;
-        if (region == 0 && hasOrigin) {
-            for (const auto& [overlayID, accessorID] : overlayAccessors) {
-                if (accessorID == overlayUvAccessor) {
-                    gpu.overlayVertexBuffers.push_back(
-                        OverlayVertexBuffer{overlayID, 0, gpu.cpuVertexData});
-                    continue;
-                }
-
-                CesiumGltf::AccessorView<CesiumGltf::AccessorTypes::VEC2<float>> extraOverlayUvs(
-                    model,
-                    accessorID);
-                if (extraOverlayUvs.status() != CesiumGltf::AccessorViewStatus::Valid ||
-                    extraOverlayUvs.size() != positions.size()) {
-                    continue;
-                }
-
-                std::vector<float> overlayVertexData;
-                overlayVertexData.reserve(static_cast<size_t>(positions.size()) * 5);
-                for (int64_t i = 0; i < positions.size(); ++i) {
-                    const auto& p = positions[i];
-                    const glm::dvec3 ecef = glm::dvec3(
-                        transform * glm::dvec4(p.value[0], p.value[1], p.value[2], 1.0));
-                    const glm::dvec3 relative = ecef - gpu.originEcef;
-                    const auto& uv = extraOverlayUvs[i];
-                    overlayVertexData.push_back(static_cast<float>(relative.x));
-                    overlayVertexData.push_back(static_cast<float>(relative.y));
-                    overlayVertexData.push_back(static_cast<float>(relative.z));
-                    overlayVertexData.push_back(uv.value[0]);
-                    overlayVertexData.push_back(uv.value[1]);
-                }
+    gpu.cpuVertexData = std::move(vertexData);
+    gpu.baseCpuVertexData = gpu.cpuVertexData;
+    if (hasOrigin) {
+        for (const auto& [overlayID, accessorID] : overlayAccessors) {
+            if (accessorID == overlayUvAccessor) {
                 gpu.overlayVertexBuffers.push_back(
-                    OverlayVertexBuffer{
-                        overlayID,
-                        0,
-                        std::move(overlayVertexData)});
+                    OverlayVertexBuffer{overlayID, 0, gpu.cpuVertexData});
+                continue;
             }
+
+            CesiumGltf::AccessorView<CesiumGltf::AccessorTypes::VEC2<float>> extraOverlayUvs(
+                model,
+                accessorID);
+            if (extraOverlayUvs.status() != CesiumGltf::AccessorViewStatus::Valid ||
+                extraOverlayUvs.size() != positions.size()) {
+                continue;
+            }
+
+            std::vector<float> overlayVertexData;
+            overlayVertexData.reserve(static_cast<size_t>(positions.size()) * 5);
+            for (int64_t i = 0; i < positions.size(); ++i) {
+                const auto& p = positions[i];
+                const glm::dvec3 localPosition(p.value[0], p.value[1], p.value[2]);
+                const glm::dvec3 ecef = isQuantizedMeshTerrain
+                    ? skirtMeshMetadata->meshCenter + localPosition
+                    : glm::dvec3(transform * glm::dvec4(localPosition, 1.0));
+                const glm::dvec3 relative = ecef - gpu.originEcef;
+                const auto& uv = extraOverlayUvs[i];
+                overlayVertexData.push_back(static_cast<float>(relative.x));
+                overlayVertexData.push_back(static_cast<float>(relative.y));
+                overlayVertexData.push_back(static_cast<float>(relative.z));
+                overlayVertexData.push_back(uv.value[0]);
+                overlayVertexData.push_back(uv.value[1]);
+            }
+            gpu.overlayVertexBuffers.push_back(
+                OverlayVertexBuffer{
+                    overlayID,
+                    0,
+                    std::move(overlayVertexData)});
         }
-        gpu.cpuIndexData = cpuIndices;
-        gpu.indexCount = static_cast<GLsizei>(cpuIndices.size());
-        gpu.indexType = GL_UNSIGNED_INT;
-        resources.bytes += gpu.cpuVertexData.size() * sizeof(float);
-        resources.bytes += gpu.cpuIndexData.size() * sizeof(uint32_t);
-        resources.primitives.push_back(gpu);
     }
+    gpu.cpuIndexData = cpuIndices;
+    gpu.indexCount = static_cast<GLsizei>(cpuIndices.size());
+    gpu.indexType = GL_UNSIGNED_INT;
+    resources.bytes += gpu.cpuVertexData.size() * sizeof(float);
+    resources.bytes += gpu.cpuIndexData.size() * sizeof(uint32_t);
+    resources.primitives.push_back(gpu);
 }
 
 std::vector<uint32_t> MinimalPrepareRendererResources::readIndices(

@@ -19,6 +19,8 @@ import com.example.cesiumpoc.cesium_native_android_poc.ImagerySource
 import com.example.cesiumpoc.cesium_native_android_poc.CesiumPerformanceOptions
 import com.example.cesiumpoc.cesium_native_android_poc.CesiumRenderStats
 import com.example.cesiumpoc.cesium_native_android_poc.NativeCesiumBridge
+import com.example.cesiumpoc.cesium_native_android_poc.QuantizedMeshTerrainSource
+import com.example.cesiumpoc.cesium_native_android_poc.TerrainSource
 import com.example.cesiumpoc.cesium_native_android_poc.UrlTemplateImagerySource
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
@@ -161,6 +163,11 @@ internal class CesiumMapRenderSurface(
             field = value
             applyImagerySource(force = true)
         }
+    var terrainSource: TerrainSource? = null
+        set(value) {
+            field = value
+            applyTerrainSource(force = true)
+        }
 
     var onStats: ((CesiumRenderStats) -> Unit)? = null
     var onMapReady: (() -> Unit)? = null
@@ -192,6 +199,8 @@ internal class CesiumMapRenderSurface(
     private var inertiaLastFrameNanos = 0L
     private var inertiaRunning = false
     private var multiTouchTracking = false
+    private var firstMultiTouchPointerId = MotionEvent.INVALID_POINTER_ID
+    private var secondMultiTouchPointerId = MotionEvent.INVALID_POINTER_ID
     private var lastMultiTouchAngleDegrees = 0.0
     private var lastMultiTouchFocusY = 0.0
     private var lastMultiTouchFirstY = 0.0
@@ -285,6 +294,7 @@ internal class CesiumMapRenderSurface(
                 cesiumBridge.onSurfaceChanged(widthPx, heightPx)
                 applyEffectiveMaximumScreenSpaceError(force = true)
                 applyImagerySource(force = true)
+                applyTerrainSource(force = true)
                 val camera = cameraState
                 syncLocalCamera(
                     cesiumBridge.updateCamera(
@@ -452,6 +462,12 @@ internal class CesiumMapRenderSurface(
         cesiumBridge.setImageryUrlTemplate(urlTemplate)
     }
 
+    private fun applyTerrainSource(force: Boolean = false) {
+        if (!force && terrainSource == null) return
+        val layerJsonUrl = (terrainSource as? QuantizedMeshTerrainSource)?.layerJsonUrl
+        cesiumBridge.setTerrainLayerJsonUrl(layerJsonUrl)
+    }
+
     private fun emitError(code: String, message: String, details: String? = null) {
         mainHandler.post { onError?.invoke(code, message, details) }
     }
@@ -485,27 +501,29 @@ internal class CesiumMapRenderSurface(
         if (event.pointerCount < 2) return false
         if (!gestureOptions.rotateEnabled && !gestureOptions.tiltEnabled) return false
 
-        val firstX = event.getX(0).toDouble()
-        val firstY = event.getY(0).toDouble()
-        val secondX = event.getX(1).toDouble()
-        val secondY = event.getY(1).toDouble()
-        val angleDegrees = Math.toDegrees(atan2(secondY - firstY, secondX - firstX))
-        val focusX = (firstX + secondX) * 0.5
-        val focusY = (firstY + secondY) * 0.5
-
         if (
             !multiTouchTracking ||
             event.actionMasked == MotionEvent.ACTION_POINTER_DOWN ||
             event.actionMasked == MotionEvent.ACTION_DOWN
         ) {
-            multiTouchTracking = true
-            lastMultiTouchAngleDegrees = angleDegrees
-            lastMultiTouchFocusY = focusY
-            lastMultiTouchFirstY = firstY
-            lastMultiTouchSecondY = secondY
-            stopInertia()
+            beginMultiTouchTracking(event)
             return false
         }
+
+        val firstPointerIndex = event.findPointerIndex(firstMultiTouchPointerId)
+        val secondPointerIndex = event.findPointerIndex(secondMultiTouchPointerId)
+        if (firstPointerIndex < 0 || secondPointerIndex < 0) {
+            beginMultiTouchTracking(event)
+            return false
+        }
+
+        val firstX = event.getX(firstPointerIndex).toDouble()
+        val firstY = event.getY(firstPointerIndex).toDouble()
+        val secondX = event.getX(secondPointerIndex).toDouble()
+        val secondY = event.getY(secondPointerIndex).toDouble()
+        val angleDegrees = Math.toDegrees(atan2(secondY - firstY, secondX - firstX))
+        val focusX = (firstX + secondX) * 0.5
+        val focusY = (firstY + secondY) * 0.5
 
         if (event.actionMasked != MotionEvent.ACTION_MOVE) return false
 
@@ -540,6 +558,25 @@ internal class CesiumMapRenderSurface(
         lastMultiTouchSecondY = secondY
 
         return changed
+    }
+
+    private fun beginMultiTouchTracking(event: MotionEvent) {
+        if (event.pointerCount < 2) {
+            resetMultiTouchTracking()
+            return
+        }
+        firstMultiTouchPointerId = event.getPointerId(0)
+        secondMultiTouchPointerId = event.getPointerId(1)
+        val firstX = event.getX(0).toDouble()
+        val firstY = event.getY(0).toDouble()
+        val secondX = event.getX(1).toDouble()
+        val secondY = event.getY(1).toDouble()
+        multiTouchTracking = true
+        lastMultiTouchAngleDegrees = Math.toDegrees(atan2(secondY - firstY, secondX - firstX))
+        lastMultiTouchFocusY = (firstY + secondY) * 0.5
+        lastMultiTouchFirstY = firstY
+        lastMultiTouchSecondY = secondY
+        stopInertia()
     }
 
     private fun applyZoomDelta(delta: Double, focusX: Double? = null, focusY: Double? = null) {
@@ -633,12 +670,7 @@ internal class CesiumMapRenderSurface(
     }
 
     private fun effectiveMaximumScreenSpaceError(): Double {
-        val movementMaximumScreenSpaceError = performanceOptions.movementMaximumScreenSpaceError
-        val isMovementPhase = autoOrbit || inertiaRunning || isCameraMoving
-        if (movementMaximumScreenSpaceError == null || !isMovementPhase) {
-            return performanceOptions.maximumScreenSpaceError
-        }
-        return max(performanceOptions.maximumScreenSpaceError, movementMaximumScreenSpaceError)
+        return performanceOptions.maximumScreenSpaceError
     }
 
     private fun startInertia(velocityX: Double, velocityY: Double) {
@@ -660,6 +692,8 @@ internal class CesiumMapRenderSurface(
 
     private fun resetMultiTouchTracking() {
         multiTouchTracking = false
+        firstMultiTouchPointerId = MotionEvent.INVALID_POINTER_ID
+        secondMultiTouchPointerId = MotionEvent.INVALID_POINTER_ID
         lastMultiTouchAngleDegrees = 0.0
         lastMultiTouchFocusY = 0.0
         lastMultiTouchFirstY = 0.0
@@ -780,7 +814,7 @@ private class EglRenderThread(
                 EGL14.EGL_GREEN_SIZE, 8,
                 EGL14.EGL_BLUE_SIZE, 8,
                 EGL14.EGL_ALPHA_SIZE, 8,
-                EGL14.EGL_DEPTH_SIZE, 0,
+                EGL14.EGL_DEPTH_SIZE, 24,
                 EGL14.EGL_NONE,
             ),
             0,

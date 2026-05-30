@@ -24,7 +24,7 @@ internal class NativeCesiumBridge {
 
     fun cameraState(): CesiumCameraState {
         if (nativeHandle == 0L) {
-            return CesiumCameraState(104.0, 35.0, 3_535_534.0, false, pitch = 35.0)
+            return CesiumCameraState(104.0, 35.0, 3_535_534.0, false, pitch = 0.0)
         }
         return nativeCameraState(nativeHandle).toCameraState()
     }
@@ -82,6 +82,11 @@ internal class NativeCesiumBridge {
     fun setImageryUrlTemplate(urlTemplate: String?) {
         if (nativeHandle == 0L) return
         nativeSetImageryUrlTemplate(nativeHandle, urlTemplate)
+    }
+
+    fun setTerrainLayerJsonUrl(url: String?) {
+        if (nativeHandle == 0L) return
+        nativeSetTerrainLayerJsonUrl(nativeHandle, url)
     }
 
     fun onSurfaceCreated() {
@@ -188,6 +193,7 @@ internal class NativeCesiumBridge {
     private external fun nativeRecommendedFrameIntervalNanos(handle: Long): Long
     private external fun nativeSetMaximumScreenSpaceError(handle: Long, maximumScreenSpaceError: Double)
     private external fun nativeSetImageryUrlTemplate(handle: Long, urlTemplate: String?)
+    private external fun nativeSetTerrainLayerJsonUrl(handle: Long, url: String?)
     private external fun nativeClearMemory(handle: Long)
     private external fun nativeIsCesiumNativeLinked(): Boolean
     private external fun nativeBackendName(): String

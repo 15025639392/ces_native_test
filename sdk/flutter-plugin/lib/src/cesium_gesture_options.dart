@@ -2,7 +2,7 @@ class CesiumGestureOptions {
   const CesiumGestureOptions({
     this.panEnabled = true,
     this.zoomEnabled = true,
-    this.rotateEnabled = false,
+    this.rotateEnabled = true,
     this.tiltEnabled = true,
     this.inertiaEnabled = true,
   });
@@ -25,7 +25,7 @@ class CesiumGestureOptions {
     return CesiumGestureOptions(
       panEnabled: map['panEnabled'] as bool? ?? true,
       zoomEnabled: map['zoomEnabled'] as bool? ?? true,
-      rotateEnabled: map['rotateEnabled'] as bool? ?? false,
+      rotateEnabled: map['rotateEnabled'] as bool? ?? true,
       tiltEnabled: map['tiltEnabled'] as bool? ?? true,
       inertiaEnabled: map['inertiaEnabled'] as bool? ?? true,
     );

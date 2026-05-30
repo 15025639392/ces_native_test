@@ -17,8 +17,21 @@ import com.example.cesiumpoc.cesium_native_android_poc.CesiumMapListener
 import com.example.cesiumpoc.cesium_native_android_poc.CesiumMapView
 import com.example.cesiumpoc.cesium_native_android_poc.CesiumPerformanceOptions
 import com.example.cesiumpoc.cesium_native_android_poc.CesiumRenderStats
+import com.example.cesiumpoc.cesium_native_android_poc.QuantizedMeshTerrainSource
+import com.example.cesiumpoc.cesium_native_android_poc.UrlTemplateImagerySource
 
 class NativeSdkMapActivity : Activity() {
+    private val imagerySource =
+        UrlTemplateImagerySource(
+            id = "osm",
+            urlTemplate = "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        )
+    private val terrainSource =
+        QuantizedMeshTerrainSource(
+            id = "swisstopo_terrain",
+            layerJsonUrl = "https://3d.geo.admin.ch/ch.swisstopo.terrain.3d/v1/20250101/layer.json",
+        )
+
     private lateinit var mapView: CesiumMapView
     private lateinit var statusView: TextView
     private lateinit var cameraView: TextView
@@ -43,14 +56,17 @@ class NativeSdkMapActivity : Activity() {
             onCreate()
             setCamera(
                 CesiumCameraState(
-                    longitude = 104.0,
-                    latitude = 35.0,
-                    altitudeMeters = 3_535_534.0,
+                    longitude = 7.75,
+                    latitude = 46.02,
+                    altitudeMeters = 80_000.0,
                     autoOrbit = false,
-                    pitch = 35.0,
+                    bearing = 25.0,
+                    pitch = 55.0,
                 ),
             )
             performanceOptions = CesiumPerformanceOptions(maximumScreenSpaceError = maximumScreenSpaceError)
+            imagerySource = this@NativeSdkMapActivity.imagerySource
+            terrainSource = this@NativeSdkMapActivity.terrainSource
             setListener(
                 object : CesiumMapListener {
                     override fun onMapReady() {
@@ -164,7 +180,7 @@ class NativeSdkMapActivity : Activity() {
     }
 
     private fun renderPerformance() {
-        performanceView.text = "detail  mse ${maximumScreenSpaceError.format(1)}"
+        performanceView.text = "detail  mse ${maximumScreenSpaceError.format(1)}  terrain ${terrainSource.id}"
     }
 
     private fun metricText(text: String): TextView {

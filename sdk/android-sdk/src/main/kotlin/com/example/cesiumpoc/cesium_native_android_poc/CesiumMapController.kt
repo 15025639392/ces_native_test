@@ -12,6 +12,7 @@ interface CesiumMapController {
     var gestureOptions: CesiumGestureOptions
     var performanceOptions: CesiumPerformanceOptions
     var imagerySource: ImagerySource?
+    var terrainSource: TerrainSource?
 
     fun setCamera(camera: CesiumCameraState) {
         cameraState = camera

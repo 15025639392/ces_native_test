@@ -21,8 +21,6 @@ namespace cesium_poc {
 class MinimalPrepareRendererResources final
     : public Cesium3DTilesSelection::IPrepareRendererResources {
 public:
-    struct Marker {};
-
     ~MinimalPrepareRendererResources() override;
 
     CesiumAsync::Future<Cesium3DTilesSelection::TileLoadResultAndRenderResources>
@@ -97,7 +95,6 @@ private:
         const CesiumGltf::Model& model,
         const CesiumGltf::MeshPrimitive& primitive,
         const glm::dmat4& transform,
-        const Cesium3DTilesSelection::Tile& tile,
         GpuTileResources& resources);
 
     static std::vector<uint32_t> readIndices(

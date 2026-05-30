@@ -11,6 +11,7 @@ import 'cesium_map_error.dart';
 import 'cesium_performance_options.dart';
 import 'cesium_render_stats.dart';
 import 'imagery_source.dart';
+import 'terrain_source.dart';
 
 const _cesiumMapViewType = 'cesium_map_view';
 
@@ -22,12 +23,13 @@ class CesiumMapWidget extends StatefulWidget {
       latitude: 35.0,
       altitudeMeters: 3535534.0,
       autoOrbit: false,
-      pitch: 35.0,
+      pitch: 0.0,
     ),
     this.interactionEnabled = true,
     this.gestureOptions = const CesiumGestureOptions(),
     this.performanceOptions = const CesiumPerformanceOptions(),
     this.imagerySource,
+    this.terrainSource,
     this.onMapCreated,
     this.onMapReady,
     this.onCameraMoveStarted,
@@ -43,6 +45,7 @@ class CesiumMapWidget extends StatefulWidget {
   final CesiumGestureOptions gestureOptions;
   final CesiumPerformanceOptions performanceOptions;
   final ImagerySource? imagerySource;
+  final TerrainSource? terrainSource;
   final ValueChanged<CesiumMapController>? onMapCreated;
   final VoidCallback? onMapReady;
   final ValueChanged<CesiumCameraState>? onCameraMoveStarted;
@@ -92,6 +95,7 @@ class _CesiumMapWidgetState extends State<CesiumMapWidget> {
     await controller.setGestureOptions(widget.gestureOptions);
     await controller.setPerformanceOptions(widget.performanceOptions);
     await controller.setImagerySource(widget.imagerySource);
+    await controller.setTerrainSource(widget.terrainSource);
     await controller.setCamera(widget.initialCamera);
   }
 
@@ -111,6 +115,16 @@ class _CesiumMapWidgetState extends State<CesiumMapWidget> {
         ...widget.gestureOptions.toMap(),
         ...widget.performanceOptions.toMap(),
         ...?widget.imagerySource?.toMap(),
+        ...?widget.terrainSource?.toMap().map((key, value) {
+          return MapEntry(
+            switch (key) {
+              'type' => 'terrainType',
+              'id' => 'terrainId',
+              _ => key,
+            },
+            value,
+          );
+        }),
       },
       creationParamsCodec: const StandardMessageCodec(),
     );

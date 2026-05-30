@@ -6,6 +6,7 @@
 #include "gl_resources.h"
 #include "imagery_source_config.h"
 #include "prepare_renderer_resources.h"
+#include "terrain_source_config.h"
 
 #include <android/log.h>
 #include <GLES3/gl3.h>
@@ -26,10 +27,13 @@
 #include <CesiumGeospatial/Cartographic.h>
 #include <CesiumGeospatial/Ellipsoid.h>
 #include <CesiumGeospatial/GlobeRectangle.h>
+#include <CesiumGeospatial/LocalHorizontalCoordinateSystem.h>
 #include <CesiumGeospatial/WebMercatorProjection.h>
 #include <CesiumRasterOverlays/RasterOverlay.h>
 #include <CesiumRasterOverlays/UrlTemplateRasterOverlay.h>
+#include <CesiumUtility/CreditSystem.h>
 #include <CesiumUtility/IntrusivePointer.h>
+#include <CesiumUtility/Math.h>
 
 #include <glm/common.hpp>
 #include <glm/geometric.hpp>
@@ -44,6 +48,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -72,39 +77,29 @@ std::string xyzUrlTemplateToCesiumTemplate(std::string urlTemplate) {
     return urlTemplate;
 }
 
-double clampDouble(double value, double minimum, double maximum) {
-    return std::min(std::max(value, minimum), maximum);
+std::string jstringToStdString(JNIEnv* env, jstring value) {
+    if (value == nullptr) return {};
+    const char* chars = env->GetStringUTFChars(value, nullptr);
+    if (chars == nullptr) return {};
+    std::string result = chars;
+    env->ReleaseStringUTFChars(value, chars);
+    return result;
 }
 
 double wrapLongitudeDegrees(double value) {
-    while (value > 180.0) value -= 360.0;
-    while (value < -180.0) value += 360.0;
-    return value;
+    const double wrapped = CesiumUtility::Math::mod(value + 180.0, 360.0) - 180.0;
+    return wrapped == -180.0 && value > 0.0 ? 180.0 : wrapped;
 }
 
 double wrapDegrees(double value) {
-    while (value >= 360.0) value -= 360.0;
-    while (value < 0.0) value += 360.0;
-    return value;
+    return CesiumUtility::Math::mod(value, 360.0);
 }
 
 double horizonDistanceMeters(double altitudeMeters) {
-    constexpr double meanEarthRadiusMeters = 6'371'000.0;
+    const double globeRadiusMeters =
+        CesiumGeospatial::Ellipsoid::WGS84.getMaximumRadius();
     const double h = std::max(altitudeMeters, 0.0);
-    return std::sqrt(h * (2.0 * meanEarthRadiusMeters + h));
-}
-
-double angularDistanceDegrees(double lonA, double latA, double lonB, double latB) {
-    const double latARadians = latA * kPi / 180.0;
-    const double latBRadians = latB * kPi / 180.0;
-    const double deltaLat = (latB - latA) * kPi / 180.0;
-    const double deltaLon = wrapLongitudeDegrees(lonB - lonA) * kPi / 180.0;
-    const double sinHalfLat = std::sin(deltaLat * 0.5);
-    const double sinHalfLon = std::sin(deltaLon * 0.5);
-    const double a =
-        sinHalfLat * sinHalfLat +
-        std::cos(latARadians) * std::cos(latBRadians) * sinHalfLon * sinHalfLon;
-    return 2.0 * std::asin(std::min(1.0, std::sqrt(a))) * 180.0 / kPi;
+    return std::sqrt(h * (2.0 * globeRadiusMeters + h));
 }
 
 CameraState normalizeGlobeCameraCoordinates(CameraState camera) {
@@ -119,7 +114,7 @@ CameraState normalizeGlobeCameraCoordinates(CameraState camera) {
         camera.bearingDegrees += 180.0;
     }
     constexpr double poleEpsilonDegrees = 0.000001;
-    camera.latitudeDegrees = clampDouble(
+    camera.latitudeDegrees = std::clamp(
         camera.latitudeDegrees,
         -90.0 + poleEpsilonDegrees,
         90.0 - poleEpsilonDegrees);
@@ -129,9 +124,9 @@ CameraState normalizeGlobeCameraCoordinates(CameraState camera) {
 CameraState sanitizeCamera(CameraState camera) {
     camera = normalizeGlobeCameraCoordinates(camera);
     camera.longitudeDegrees = wrapLongitudeDegrees(camera.longitudeDegrees);
-    camera.altitudeMeters = clampDouble(camera.altitudeMeters, 500.0, 20'000'000.0);
+    camera.altitudeMeters = std::clamp(camera.altitudeMeters, 500.0, 20'000'000.0);
     camera.bearingDegrees = wrapDegrees(camera.bearingDegrees);
-    camera.pitchDegrees = clampDouble(camera.pitchDegrees, 0.0, 85.0);
+    camera.pitchDegrees = std::clamp(camera.pitchDegrees, 0.0, 85.0);
     return camera;
 }
 
@@ -142,46 +137,43 @@ struct NativeCameraFrame {
     glm::dvec3 up = glm::dvec3(0.0, 1.0, 0.0);
 };
 
-struct LocalTangentFrame {
-    glm::dvec3 east = glm::dvec3(1.0, 0.0, 0.0);
-    glm::dvec3 north = glm::dvec3(0.0, 1.0, 0.0);
-    glm::dvec3 up = glm::dvec3(0.0, 0.0, 1.0);
-};
-
-LocalTangentFrame buildLocalTangentFrame(double longitudeDegrees, double latitudeDegrees) {
-    const CesiumGeospatial::Cartographic surfaceCartographic =
-        CesiumGeospatial::Cartographic::fromDegrees(longitudeDegrees, latitudeDegrees, 0.0);
-    const glm::dvec3 up =
-        CesiumGeospatial::Ellipsoid::WGS84.geodeticSurfaceNormal(surfaceCartographic);
-    const double longitudeRadians = longitudeDegrees * kPi / 180.0;
-    glm::dvec3 east(-std::sin(longitudeRadians), std::cos(longitudeRadians), 0.0);
-    if (glm::length(east) < 0.000001) {
-        east = glm::dvec3(1.0, 0.0, 0.0);
-    } else {
-        east = glm::normalize(east);
-    }
-    const glm::dvec3 north = glm::normalize(glm::cross(up, east));
-    return {east, north, up};
+CesiumGeospatial::LocalHorizontalCoordinateSystem buildWgs84LocalHorizontal(
+    double longitudeDegrees,
+    double latitudeDegrees) {
+    return CesiumGeospatial::LocalHorizontalCoordinateSystem(
+        CesiumGeospatial::Cartographic::fromDegrees(longitudeDegrees, latitudeDegrees, 0.0),
+        CesiumGeospatial::LocalDirection::East,
+        CesiumGeospatial::LocalDirection::North,
+        CesiumGeospatial::LocalDirection::Up,
+        1.0,
+        CesiumGeospatial::Ellipsoid::WGS84);
 }
 
 NativeCameraFrame buildCameraFrame(const CameraState& camera) {
-    const CesiumGeospatial::Cartographic eyeCartographic =
+    const CesiumGeospatial::Cartographic targetCartographic =
         CesiumGeospatial::Cartographic::fromDegrees(
             camera.longitudeDegrees,
             camera.latitudeDegrees,
-            camera.altitudeMeters);
-    const glm::dvec3 eye =
-        CesiumGeospatial::Ellipsoid::WGS84.cartographicToCartesian(eyeCartographic);
-    const LocalTangentFrame local =
-        buildLocalTangentFrame(camera.longitudeDegrees, camera.latitudeDegrees);
-    const double bearingRadians = camera.bearingDegrees * kPi / 180.0;
-    const double pitchRadians = camera.pitchDegrees * kPi / 180.0;
+            0.0);
+    const glm::dvec3 target =
+        CesiumGeospatial::Ellipsoid::WGS84.cartographicToCartesian(targetCartographic);
+    const CesiumGeospatial::LocalHorizontalCoordinateSystem localHorizontal =
+        buildWgs84LocalHorizontal(camera.longitudeDegrees, camera.latitudeDegrees);
+    const glm::dvec3 localEast =
+        glm::normalize(localHorizontal.localDirectionToEcef(glm::dvec3(1.0, 0.0, 0.0)));
+    const glm::dvec3 localNorth =
+        glm::normalize(localHorizontal.localDirectionToEcef(glm::dvec3(0.0, 1.0, 0.0)));
+    const glm::dvec3 localUp =
+        glm::normalize(localHorizontal.localDirectionToEcef(glm::dvec3(0.0, 0.0, 1.0)));
+    const double bearingRadians = CesiumUtility::Math::degreesToRadians(camera.bearingDegrees);
+    const double pitchRadians = CesiumUtility::Math::degreesToRadians(camera.pitchDegrees);
     const glm::dvec3 horizontalForward =
-        glm::normalize(local.north * std::cos(bearingRadians) + local.east * std::sin(bearingRadians));
+        glm::normalize(localNorth * std::cos(bearingRadians) + localEast * std::sin(bearingRadians));
     const glm::dvec3 direction =
-        glm::normalize((-local.up) * std::cos(pitchRadians) + horizontalForward * std::sin(pitchRadians));
-    const glm::dvec3 right = glm::normalize(glm::cross(horizontalForward, local.up));
+        glm::normalize((-localUp) * std::cos(pitchRadians) + horizontalForward * std::sin(pitchRadians));
+    const glm::dvec3 right = glm::normalize(glm::cross(horizontalForward, localUp));
     const glm::dvec3 up = glm::normalize(glm::cross(right, direction));
+    const glm::dvec3 eye = target - direction * camera.altitudeMeters;
     return {eye, direction, right, up};
 }
 
@@ -195,7 +187,7 @@ std::optional<CesiumGeospatial::Cartographic> pickEllipsoid(
     const double viewportWidth = static_cast<double>(std::max(width, 1));
     const double viewportHeight = static_cast<double>(std::max(height, 1));
     const double aspect = viewportWidth / viewportHeight;
-    const double verticalFov = kPi / 3.0;
+    const double verticalFov = CesiumUtility::Math::OnePi / 3.0;
     const double tanVertical = std::tan(verticalFov * 0.5);
     const double ndcX = (2.0 * screenX / viewportWidth) - 1.0;
     const double ndcY = 1.0 - (2.0 * screenY / viewportHeight);
@@ -216,12 +208,32 @@ std::optional<CesiumGeospatial::Cartographic> pickEllipsoid(
 }
 
 CameraState shiftCameraByMeters(const CameraState& camera, double eastMeters, double northMeters) {
-    const double latRadians = camera.latitudeDegrees * kPi / 180.0;
-    const double metersPerDegreeLatitude = 110'540.0;
-    const double metersPerDegreeLongitude = std::max(111'320.0 * std::cos(latRadians), 1'000.0);
+    const CesiumGeospatial::LocalHorizontalCoordinateSystem localHorizontal =
+        buildWgs84LocalHorizontal(camera.longitudeDegrees, camera.latitudeDegrees);
+    const glm::dvec3 translatedSurface =
+        localHorizontal.localPositionToEcef(glm::dvec3(eastMeters, northMeters, 0.0));
+    const std::optional<CesiumGeospatial::Cartographic> translatedCartographic =
+        CesiumGeospatial::Ellipsoid::WGS84.cartesianToCartographic(translatedSurface);
+    if (!translatedCartographic) return sanitizeCamera(camera);
+
     CameraState next = camera;
-    next.longitudeDegrees = camera.longitudeDegrees + eastMeters / metersPerDegreeLongitude;
-    next.latitudeDegrees = camera.latitudeDegrees + northMeters / metersPerDegreeLatitude;
+    next.longitudeDegrees = CesiumUtility::Math::radiansToDegrees(translatedCartographic->longitude);
+    next.latitudeDegrees = CesiumUtility::Math::radiansToDegrees(translatedCartographic->latitude);
+    return sanitizeCamera(next);
+}
+
+CameraState shiftCameraBySurfaceDelta(const CameraState& camera, const glm::dvec3& surfaceDelta) {
+    const CesiumGeospatial::Cartographic surfaceCartographic =
+        CesiumGeospatial::Cartographic::fromDegrees(camera.longitudeDegrees, camera.latitudeDegrees, 0.0);
+    const glm::dvec3 surface =
+        CesiumGeospatial::Ellipsoid::WGS84.cartographicToCartesian(surfaceCartographic);
+    const std::optional<CesiumGeospatial::Cartographic> shiftedCartographic =
+        CesiumGeospatial::Ellipsoid::WGS84.cartesianToCartographic(surface + surfaceDelta);
+    if (!shiftedCartographic) return sanitizeCamera(camera);
+
+    CameraState next = camera;
+    next.longitudeDegrees = CesiumUtility::Math::radiansToDegrees(shiftedCartographic->longitude);
+    next.latitudeDegrees = CesiumUtility::Math::radiansToDegrees(shiftedCartographic->latitude);
     return sanitizeCamera(next);
 }
 
@@ -239,7 +251,8 @@ CameraState shiftCameraByScreenPick(
         pickEllipsoid(camera, width, height, currentX, currentY);
     if (!previousPick || !currentPick) {
         const double metersPerPixel =
-            2.0 * camera.altitudeMeters * std::tan((kPi / 3.0) * 0.5) / static_cast<double>(std::max(height, 1));
+            2.0 * camera.altitudeMeters * std::tan((CesiumUtility::Math::OnePi / 3.0) * 0.5) /
+            static_cast<double>(std::max(height, 1));
         const double eastMeters = (currentX - previousX) * metersPerPixel;
         const double northMeters = -(currentY - previousY) * metersPerPixel;
         return shiftCameraByMeters(camera, -eastMeters, -northMeters);
@@ -250,11 +263,7 @@ CameraState shiftCameraByScreenPick(
     const glm::dvec3 currentCartesian =
         CesiumGeospatial::Ellipsoid::WGS84.cartographicToCartesian(*currentPick);
     const glm::dvec3 surfaceDelta = currentCartesian - previousCartesian;
-    const LocalTangentFrame local =
-        buildLocalTangentFrame(camera.longitudeDegrees, camera.latitudeDegrees);
-    const double eastMeters = glm::dot(surfaceDelta, local.east);
-    const double northMeters = glm::dot(surfaceDelta, local.north);
-    return shiftCameraByMeters(camera, -eastMeters, -northMeters);
+    return shiftCameraBySurfaceDelta(camera, -surfaceDelta);
 }
 
 CameraState keepFocusStable(
@@ -275,11 +284,7 @@ CameraState keepFocusStable(
     const glm::dvec3 newCartesian =
         CesiumGeospatial::Ellipsoid::WGS84.cartographicToCartesian(*newPick);
     const glm::dvec3 focusDelta = oldCartesian - newCartesian;
-    const LocalTangentFrame local =
-        buildLocalTangentFrame(newCamera.longitudeDegrees, newCamera.latitudeDegrees);
-    const double eastMeters = glm::dot(focusDelta, local.east);
-    const double northMeters = glm::dot(focusDelta, local.north);
-    return shiftCameraByMeters(newCamera, eastMeters, northMeters);
+    return shiftCameraBySurfaceDelta(newCamera, focusDelta);
 }
 
 class GlobeCameraController {
@@ -362,11 +367,12 @@ public:
         : _taskProcessor(std::make_shared<BackgroundTaskProcessor>(8)),
           _prepareRendererResources(std::make_shared<MinimalPrepareRendererResources>()),
           _assetAccessor(createCurlAssetAccessor()),
+          _creditSystem(std::make_shared<CesiumUtility::CreditSystem>()),
           _externals{
               _assetAccessor,
               _prepareRendererResources,
               CesiumAsync::AsyncSystem(_taskProcessor),
-              nullptr,
+              _creditSystem,
               spdlog::default_logger(),
               nullptr,
               Cesium3DTilesSelection::TilesetSharedAssetSystem::getDefault(),
@@ -378,10 +384,6 @@ public:
         if (_program != 0) {
             glDeleteProgram(_program);
         }
-        if (_textureArrayProgram != 0) {
-            glDeleteProgram(_textureArrayProgram);
-        }
-        freeTextureArrayBatch();
         if (_fallbackTexture != 0) {
             glDeleteTextures(1, &_fallbackTexture);
         }
@@ -398,13 +400,7 @@ public:
 	            std::abs(_camera.bearingDegrees - sanitizedCamera.bearingDegrees) > 0.0001 ||
 	            std::abs(_camera.pitchDegrees - sanitizedCamera.pitchDegrees) > 0.0001;
 	        _camera = sanitizedCamera;
-        const CesiumGeospatial::Cartographic cartographic =
-            CesiumGeospatial::Cartographic::fromDegrees(
-                sanitizedCamera.longitudeDegrees,
-                sanitizedCamera.latitudeDegrees,
-                sanitizedCamera.altitudeMeters);
-        const glm::dvec3 ecef =
-            CesiumGeospatial::Ellipsoid::WGS84.cartographicToCartesian(cartographic);
+        const glm::dvec3 ecef = buildCameraFrame(sanitizedCamera).eye;
         _ecef = {ecef.x, ecef.y, ecef.z};
 	        if (changed) {
 	            _cameraDirty = true;
@@ -518,7 +514,26 @@ public:
 
 	    void onSurfaceCreated() {
 	        _program = createProgram();
-            _textureArrayProgram = createTextureArrayProgram();
+            if (_fallbackTexture == 0) {
+                const uint8_t pixel[] = {108, 126, 94, 255};
+                glGenTextures(1, &_fallbackTexture);
+                glBindTexture(GL_TEXTURE_2D, _fallbackTexture);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glTexImage2D(
+                    GL_TEXTURE_2D,
+                    0,
+                    GL_RGBA,
+                    1,
+                    1,
+                    0,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    pixel);
+                glBindTexture(GL_TEXTURE_2D, 0);
+            }
 	        _locations.projection = glGetUniformLocation(_program, "u_projection");
 	        _locations.originEye = glGetUniformLocation(_program, "u_originEye");
 	        _locations.right = glGetUniformLocation(_program, "u_right");
@@ -526,39 +541,14 @@ public:
 	        _locations.backward = glGetUniformLocation(_program, "u_backward");
 	        _locations.texture = glGetUniformLocation(_program, "u_texture");
 	        _locations.uvTranslation = glGetUniformLocation(_program, "u_uvTranslation");
-	        _locations.uvScale = glGetUniformLocation(_program, "u_uvScale");
+            _locations.uvScale = glGetUniformLocation(_program, "u_uvScale");
             _locations.discardOutsideUv = glGetUniformLocation(_program, "u_discardOutsideUv");
-            _textureArrayLocations.projection = glGetUniformLocation(_textureArrayProgram, "u_projection");
-            _textureArrayLocations.originEye = glGetUniformLocation(_textureArrayProgram, "u_originEye");
-            _textureArrayLocations.right = glGetUniformLocation(_textureArrayProgram, "u_right");
-            _textureArrayLocations.up = glGetUniformLocation(_textureArrayProgram, "u_up");
-            _textureArrayLocations.backward = glGetUniformLocation(_textureArrayProgram, "u_backward");
-            _textureArrayLocations.texture = glGetUniformLocation(_textureArrayProgram, "u_textureArray");
+            _locations.alpha = glGetUniformLocation(_program, "u_alpha");
 	        glEnable(GL_DEPTH_TEST);
 	        glDepthFunc(GL_LEQUAL);
             glDisable(GL_CULL_FACE);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        if (_fallbackTexture == 0) {
-            const uint8_t pixels[4] = {126, 136, 118, 255};
-            glGenTextures(1, &_fallbackTexture);
-            glBindTexture(GL_TEXTURE_2D, _fallbackTexture);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            glTexImage2D(
-                GL_TEXTURE_2D,
-                0,
-                GL_RGBA,
-                1,
-                1,
-                0,
-                GL_RGBA,
-                GL_UNSIGNED_BYTE,
-                pixels);
-            glBindTexture(GL_TEXTURE_2D, 0);
-        }
         if (!_tileset) {
             recreateTileset(_maximumScreenSpaceError);
         }
@@ -593,6 +583,16 @@ public:
     void setImageryUrlTemplate(const std::string& urlTemplate) {
         if (satelliteImageryUrlTemplate() == urlTemplate) return;
         setSatelliteImageryUrlTemplate(urlTemplate);
+        std::lock_guard<std::mutex> lock(_mutex);
+        _tilesetRebuildRequested = true;
+        _cameraDirty = true;
+        _selectionSettled = false;
+        _stableSelectionFrames = 0;
+    }
+
+    void setTerrainLayerJsonUrl(const std::string& url) {
+        if (terrainLayerJsonUrl() == url) return;
+        cesium_poc::setTerrainLayerJsonUrl(url);
         std::lock_guard<std::mutex> lock(_mutex);
         _tilesetRebuildRequested = true;
         _cameraDirty = true;
@@ -637,10 +637,11 @@ public:
 	        const auto elapsed = drawEnd - start;
 	        _drawMs = std::chrono::duration<double, std::milli>(elapsed).count();
 	        if ((_frameUpdates % 60) == 0) {
+                const bool polarSafety = needsConservativeGlobeCulling(camera);
 	            __android_log_print(
 	                ANDROID_LOG_INFO,
 	                "CesiumBridge",
-	                "frame total=%.3fms selection=%.3fms draw=%.3fms pressure=%.2f pendingGeometryUploads=%zu pendingRasterUploads=%zu selectionSkipped=%d moving=%d mainDispatchSkipped=%d loadTilesSkipped=%d",
+	                "frame total=%.3fms selection=%.3fms draw=%.3fms pressure=%.2f pendingGeometryUploads=%zu pendingRasterUploads=%zu selectionSkipped=%d moving=%d mainDispatchSkipped=%d loadTilesSkipped=%d sse=%.2f polarSafety=%d frustum=%d occlusion=%d renderUnderCamera=%d workerQueue=%d mainQueue=%d",
 	                _drawMs,
 	                _selectionMs,
 	                _gpuDrawMs,
@@ -650,7 +651,14 @@ public:
 	                _selectionSkipped ? 1 : 0,
                     _cameraMoving ? 1 : 0,
                     _mainThreadDispatchSkipped ? 1 : 0,
-                    _loadTilesSkipped ? 1 : 0);
+                    _loadTilesSkipped ? 1 : 0,
+                    _maximumScreenSpaceError,
+                    polarSafety ? 1 : 0,
+                    1,
+                    1,
+                    0,
+                    _workerQueueLength,
+                    _mainQueueLength);
 	        }
 	    }
 
@@ -659,6 +667,7 @@ public:
         _selectedResources.clear();
         _selectedPrimitiveSet.clear();
         _continuityResources.clear();
+        _fadeAlphaByResource.clear();
         _uploadPriorityResources.clear();
         _selectedDrawablePrimitiveCount = 0;
         _selectedTexturedPrimitiveCount = 0;
@@ -666,10 +675,8 @@ public:
         _selectedCameraLongitudeDegrees = _camera.longitudeDegrees;
         _selectedCameraLatitudeDegrees = _camera.latitudeDegrees;
         _selectedAverageTileLevel = 0.0;
-        _batchSelectionGeneration = 0;
         ++_selectionGeneration;
         _consecutiveSelectionPreservationFrames = 0;
-        _continuityResourceFramesRemaining = 0;
 	        _cameraDirty = true;
 	        _selectionSettled = false;
 	        _stableSelectionFrames = 0;
@@ -725,29 +732,28 @@ private:
         size_t drawCalls = 0;
         size_t skippedByBudget = 0;
         size_t missingOverlayStreams = 0;
+        size_t primitivesMissingGeometry = 0;
+        size_t primitivesMissingRaster = 0;
+        size_t primitivesSkippedWithoutReadyRaster = 0;
+        size_t primitivesSkippedForContinuityBackdrop = 0;
     };
 
     struct DrawCommand {
         const GpuPrimitive* primitive = nullptr;
         const RasterAttachment* attachment = nullptr;
+        const GpuTileResources* resources = nullptr;
         GLuint vertexBuffer = 0;
         double distanceSq = 0.0;
         bool continuity = false;
+        float alpha = 1.0f;
     };
 
-    struct TextureArrayBatch {
-        GLuint vertexBuffer = 0;
-        GLuint indexBuffer = 0;
-        GLuint textureArray = 0;
-        GLsizei indexCount = 0;
-        size_t primitiveCount = 0;
-        std::vector<const GpuPrimitive*> primitives;
-        int32_t width = 0;
-        int32_t height = 0;
-        glm::dvec3 originEcef = glm::dvec3(0.0);
-        bool ownsTexture = true;
-        bool valid = false;
-    };
+    float alphaForResources(const GpuTileResources* resources) const {
+        if (!resources) return 1.0f;
+        const auto alphaIt = _fadeAlphaByResource.find(resources);
+        if (alphaIt == _fadeAlphaByResource.end()) return 1.0f;
+        return std::min(std::max(alphaIt->second, 0.0f), 1.0f);
+    }
 
     static size_t countDrawablePrimitives(const std::vector<const GpuTileResources*>& resourcesList) {
         size_t drawable = 0;
@@ -763,19 +769,36 @@ private:
         return drawable;
     }
 
-    static size_t countTexturedPrimitives(const std::vector<const GpuTileResources*>& resourcesList) {
-        size_t textured = 0;
+    static bool hasRenderReadyRasterAttachment(const GpuPrimitive& primitive) {
+        if (primitive.vertexBuffer == 0 || primitive.indexBuffer == 0) return false;
+        for (const RasterAttachment& attachment : primitive.rasterAttachments) {
+            if (!attachment.textureResource || attachment.textureResource->id == 0) continue;
+            const auto overlayIt = std::find_if(
+                primitive.overlayVertexBuffers.begin(),
+                primitive.overlayVertexBuffers.end(),
+                [&attachment](const OverlayVertexBuffer& overlay) {
+                    return overlay.overlayTextureCoordinateID == attachment.overlayTextureCoordinateID &&
+                        overlay.vertexBuffer != 0;
+                });
+            if (overlayIt != primitive.overlayVertexBuffers.end()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static size_t countRenderReadyTexturedPrimitives(
+        const std::vector<const GpuTileResources*>& resourcesList) {
+        size_t renderReady = 0;
         for (const GpuTileResources* resources : resourcesList) {
             if (!resources) continue;
             for (const GpuPrimitive& primitive : resources->primitives) {
-                if (primitive.vertexBuffer != 0 &&
-                    primitive.indexBuffer != 0 &&
-                    !primitive.rasterAttachments.empty()) {
-                    ++textured;
+                if (hasRenderReadyRasterAttachment(primitive)) {
+                    ++renderReady;
                 }
             }
         }
-        return textured;
+        return renderReady;
     }
 
     static double averageTileLevel(const std::vector<SelectedTile>& tiles) {
@@ -797,35 +820,48 @@ private:
     static Cesium3DTilesSelection::TilesetOptions createTilesetOptions(double maximumScreenSpaceError) {
         Cesium3DTilesSelection::TilesetOptions options;
         options.maximumScreenSpaceError = maximumScreenSpaceError;
-        options.maximumSimultaneousTileLoads = 32;
+        options.maximumSimultaneousTileLoads = 24;
         options.preloadSiblings = true;
-        options.loadingDescendantLimit = 32;
+        options.loadingDescendantLimit = 24;
         options.forbidHoles = true;
 	        options.enableFrustumCulling = true;
 	        options.enableFogCulling = false;
-	        options.enableOcclusionCulling = true;
+        options.enableOcclusionCulling = true;
+        options.delayRefinementForOcclusion = true;
         options.renderTilesUnderCamera = false;
-        options.maximumCachedBytes = 512LL * 1024 * 1024;
-        options.mainThreadLoadingTimeLimit = 10.0;
+        options.maximumCachedBytes = 384LL * 1024 * 1024;
+        options.mainThreadLoadingTimeLimit = 12.0;
         options.tileCacheUnloadTimeLimit = 0.25;
+        options.enableLodTransitionPeriod = false;
+        options.lodTransitionLength = 0.25f;
+        options.kickDescendantsWhileFadingIn = true;
 	        options.ellipsoid = CesiumGeospatial::Ellipsoid::WGS84;
+        options.loadErrorCallback =
+            [](const Cesium3DTilesSelection::TilesetLoadFailureDetails& details) {
+                __android_log_print(
+                    ANDROID_LOG_WARN,
+                    "CesiumBridge",
+                    "tileset load failed type=%d message=%s",
+                    static_cast<int>(details.type),
+                    details.message.c_str());
+            };
 	        return options;
 	    }
 
     void applyInteractiveTilesetOptionsLocked() {
         if (!_tileset) return;
         Cesium3DTilesSelection::TilesetOptions& options = _tileset->getOptions();
-        const bool conservativeCulling = needsConservativeGlobeCulling(_camera);
         options.maximumScreenSpaceError = _maximumScreenSpaceError;
-        options.enableFrustumCulling = !conservativeCulling;
-        options.enableOcclusionCulling = !conservativeCulling;
-        options.renderTilesUnderCamera = conservativeCulling;
-        options.maximumSimultaneousTileLoads = 32;
-        options.loadingDescendantLimit = 32;
+        options.enableFrustumCulling = true;
+        options.enableOcclusionCulling = true;
+        options.delayRefinementForOcclusion = true;
+        options.renderTilesUnderCamera = false;
+        options.maximumSimultaneousTileLoads = 24;
+        options.loadingDescendantLimit = 24;
         options.mainThreadLoadingTimeLimit =
-            _framePressure > 0.75 ? 4.0 :
-            _framePressure > 0.35 ? 6.0 :
-            8.0;
+            _mainQueueLength > 1024 ? 14.0 :
+            _mainQueueLength > 512 ? 13.0 :
+            12.0;
     }
 
     void applyAdaptiveFrameBudget() {
@@ -851,17 +887,17 @@ private:
         }
 
         Cesium3DTilesSelection::TilesetOptions& options = _tileset->getOptions();
-        const bool conservativeCulling = needsConservativeGlobeCulling(_camera);
         options.maximumScreenSpaceError = _maximumScreenSpaceError;
-        options.enableFrustumCulling = !conservativeCulling;
-        options.enableOcclusionCulling = !conservativeCulling;
-        options.renderTilesUnderCamera = conservativeCulling;
-        options.maximumSimultaneousTileLoads = 32;
-        options.loadingDescendantLimit = 32;
+        options.enableFrustumCulling = true;
+        options.enableOcclusionCulling = true;
+        options.delayRefinementForOcclusion = true;
+        options.renderTilesUnderCamera = false;
+        options.maximumSimultaneousTileLoads = 24;
+        options.loadingDescendantLimit = 24;
         options.mainThreadLoadingTimeLimit =
-            _framePressure > 0.75 ? 4.0 :
-            _framePressure > 0.35 ? 6.0 :
-            8.0;
+            _mainQueueLength > 1024 ? 14.0 :
+            _mainQueueLength > 512 ? 13.0 :
+            12.0;
     }
 
     void processRendererUploads() {
@@ -870,12 +906,16 @@ private:
         const size_t pendingRasterUploads = _prepareRendererResources->pendingRasterUploads();
         const bool previousFrameOverBudget = _drawMs > 18.0 || _gpuDrawMs > 10.0;
         const size_t maxUploads =
+            pendingGeometryUploads > 1500 ? 24 :
+            pendingGeometryUploads > 512 ? 16 :
             previousFrameOverBudget ? 6 :
             _framePressure > 0.65 ? 8 :
             pendingGeometryUploads > 128 ? 12 :
             14;
         _geometryUploadsThisFrame = _prepareRendererResources->processPendingGeometryUploads(maxUploads);
         const size_t rasterUploadBudget =
+            pendingRasterUploads > 1500 ? 24 :
+            pendingRasterUploads > 512 ? 16 :
             previousFrameOverBudget ? 6 :
             _framePressure > 0.65 ? 8 :
             pendingRasterUploads > 96 ? 12 :
@@ -903,6 +943,7 @@ private:
             _selectedResources.clear();
             _selectedPrimitiveSet.clear();
             _continuityResources.clear();
+            _fadeAlphaByResource.clear();
             _uploadPriorityResources.clear();
             _selectedDrawablePrimitiveCount = 0;
             _selectedTexturedPrimitiveCount = 0;
@@ -910,13 +951,26 @@ private:
             _selectedCameraLongitudeDegrees = _camera.longitudeDegrees;
             _selectedCameraLatitudeDegrees = _camera.latitudeDegrees;
             _selectedAverageTileLevel = 0.0;
-            _batchSelectionGeneration = 0;
             ++_selectionGeneration;
             _consecutiveSelectionPreservationFrames = 0;
-            _continuityResourceFramesRemaining = 0;
-        _tileset = Cesium3DTilesSelection::EllipsoidTilesetLoader::createTileset(
-            _externals,
-            createTilesetOptions(maximumScreenSpaceError));
+        const Cesium3DTilesSelection::TilesetOptions options =
+            createTilesetOptions(maximumScreenSpaceError);
+        const std::string terrainUrl = terrainLayerJsonUrl();
+        __android_log_print(
+            ANDROID_LOG_INFO,
+            "CesiumBridge",
+            "recreate tileset terrain=%s",
+            terrainUrl.empty() ? "<ellipsoid>" : terrainUrl.c_str());
+        if (terrainUrl.empty()) {
+            _tileset = Cesium3DTilesSelection::EllipsoidTilesetLoader::createTileset(
+                _externals,
+                options);
+        } else {
+            _tileset = std::make_unique<Cesium3DTilesSelection::Tileset>(
+                _externals,
+                terrainUrl,
+                options);
+        }
         {
             std::lock_guard<std::mutex> lock(_mutex);
             applyInteractiveTilesetOptionsLocked();
@@ -951,10 +1005,10 @@ private:
         templateOptions.tileHeight = 256;
 
         CesiumRasterOverlays::RasterOverlayOptions overlayOptions;
-        overlayOptions.maximumSimultaneousTileLoads = 48;
+        overlayOptions.maximumSimultaneousTileLoads = 24;
         overlayOptions.maximumTextureSize = 2048;
         overlayOptions.maximumScreenSpaceError = maximumScreenSpaceError;
-        overlayOptions.subTileCacheBytes = static_cast<int64_t>(256 * 1024 * 1024);
+        overlayOptions.subTileCacheBytes = static_cast<int64_t>(128 * 1024 * 1024);
         overlayOptions.loadErrorCallback =
             [](const CesiumRasterOverlays::RasterOverlayLoadFailureDetails& details) {
                 __android_log_print(
@@ -989,7 +1043,7 @@ private:
         const NativeCameraFrame frame = buildCameraFrame(camera);
 
         const double aspect = static_cast<double>(_width) / static_cast<double>(_height);
-        const double verticalFov = kPi / 3.0;
+        const double verticalFov = CesiumUtility::Math::OnePi / 3.0;
         const double horizontalFov = 2.0 * std::atan(std::tan(verticalFov * 0.5) * aspect);
         Cesium3DTilesSelection::ViewState view(
             frame.eye,
@@ -1005,6 +1059,7 @@ private:
                 _tileset->getDefaultViewGroup(),
                 std::vector<Cesium3DTilesSelection::ViewState>{view},
                 static_cast<float>(deltaSeconds));
+        const bool renderFadingTiles = _tileset->getOptions().enableLodTransitionPeriod;
         _tilesVisited = result.tilesVisited;
         _workerQueueLength = result.workerThreadTileLoadQueueLength;
         _mainQueueLength = result.mainThreadTileLoadQueueLength;
@@ -1016,10 +1071,16 @@ private:
         nextSelectedTiles.reserve(result.tilesToRenderThisFrame.size());
         std::vector<const GpuTileResources*> nextSelectedResources;
         nextSelectedResources.reserve(result.tilesToRenderThisFrame.size());
+        std::vector<const GpuTileResources*> nextFadingResources;
+        nextFadingResources.reserve(renderFadingTiles ? result.tilesFadingOut.size() : 0);
+        std::unordered_map<const GpuTileResources*, float> nextFadeAlphaByResource;
+        nextFadeAlphaByResource.reserve(
+            result.tilesToRenderThisFrame.size() +
+            (renderFadingTiles ? result.tilesFadingOut.size() : 0));
         size_t selectedPrimitiveCount = 0;
         size_t drawablePrimitiveCount = 0;
         size_t texturedPrimitiveCount = 0;
-        for (const Cesium3DTilesSelection::Tile::ConstPointer& tile : result.tilesToRenderThisFrame) {
+	        for (const Cesium3DTilesSelection::Tile::ConstPointer& tile : result.tilesToRenderThisFrame) {
             const Cesium3DTilesSelection::TileRenderContent* renderContent =
                 tile->getContent().getRenderContent();
 	            if (renderContent) {
@@ -1029,14 +1090,15 @@ private:
 	                    : nullptr;
 	                nextSelectedResources.push_back(resources);
 	                if (resources) {
+                        nextFadeAlphaByResource[resources] = renderContent->getLodTransitionFadePercentage();
                         selectedPrimitiveCount += resources->primitives.size();
                         for (const GpuPrimitive& primitive : resources->primitives) {
                             if (primitive.vertexBuffer != 0 &&
                                 primitive.indexBuffer != 0) {
                                 ++drawablePrimitiveCount;
-                                if (!primitive.rasterAttachments.empty()) {
-                                    ++texturedPrimitiveCount;
-                                }
+	                                if (hasRenderReadyRasterAttachment(primitive)) {
+	                                    ++texturedPrimitiveCount;
+	                                }
                             }
                         }
                     }
@@ -1052,12 +1114,28 @@ private:
             selected.south = rectangle.getSouth();
             selected.east = rectangle.getEast();
             selected.north = rectangle.getNorth();
-            if (const auto* id = std::get_if<CesiumGeometry::QuadtreeTileID>(&tile->getTileID())) {
-                selected.level = id->level;
-                selected.x = id->x;
-                selected.y = id->y;
+	            if (const auto* id = std::get_if<CesiumGeometry::QuadtreeTileID>(&tile->getTileID())) {
+	                selected.level = id->level;
+	                selected.x = id->x;
+	                selected.y = id->y;
+	            }
+	            nextSelectedTiles.push_back(selected);
+	        }
+        if (renderFadingTiles) {
+        for (const Cesium3DTilesSelection::Tile::ConstPointer& tile : result.tilesFadingOut) {
+            const Cesium3DTilesSelection::TileRenderContent* renderContent =
+                tile->getContent().getRenderContent();
+            if (!renderContent) continue;
+            const void* rawResources = renderContent->getRenderResources();
+            const auto* resources = MinimalPrepareRendererResources::isGpuResource(rawResources)
+                ? reinterpret_cast<const GpuTileResources*>(rawResources)
+                : nullptr;
+            if (resources) {
+                nextFadingResources.push_back(resources);
+                const float fadePercentage = renderContent->getLodTransitionFadePercentage();
+                nextFadeAlphaByResource[resources] = 1.0f - fadePercentage;
             }
-            nextSelectedTiles.push_back(selected);
+        }
         }
         _uploadPriorityResources = _selectedResources;
         _uploadPriorityResources.insert(
@@ -1066,146 +1144,97 @@ private:
             nextSelectedResources.end());
         _uploadPriorityResources.insert(
             _uploadPriorityResources.end(),
-            _continuityResources.begin(),
-            _continuityResources.end());
-        const bool replacementHasDrawableContent = drawablePrimitiveCount > 0;
-        const bool replacementExpandsCoverage =
-            _selectedDrawablePrimitiveCount == 0 ||
-            drawablePrimitiveCount > static_cast<size_t>(
-                static_cast<double>(_selectedDrawablePrimitiveCount) * 1.10);
-        const bool cameraZoomedOutSinceAcceptedSelection =
-            camera.altitudeMeters > _selectedCameraAltitudeMeters * 1.03;
+            nextFadingResources.begin(),
+            nextFadingResources.end());
         const double candidateAverageLevel = averageTileLevel(nextSelectedTiles);
-        const bool replacementIsCoarserLod =
-            _selectedAverageTileLevel > 0.0 &&
-            candidateAverageLevel + 0.35 < _selectedAverageTileLevel &&
-            !cameraZoomedOutSinceAcceptedSelection;
-        const bool replacementIsTooSparse =
-            _selectedDrawablePrimitiveCount > 0 &&
-            drawablePrimitiveCount < static_cast<size_t>(
-                static_cast<double>(_selectedDrawablePrimitiveCount) * 0.98);
-        const bool replacementImageryIsTooSparse =
-            _selectedTexturedPrimitiveCount > 0 &&
-            texturedPrimitiveCount < static_cast<size_t>(
-                static_cast<double>(_selectedTexturedPrimitiveCount) * 0.98);
-        const bool uploadBacklogActive =
+        const bool hasCurrentTexturedSelection = _selectedTexturedPrimitiveCount > 0;
+        const bool candidateHasDrawableContent = drawablePrimitiveCount > 0;
+        const bool candidateRenderReadyComplete =
+            candidateHasDrawableContent && texturedPrimitiveCount >= drawablePrimitiveCount;
+        const bool candidateHasPendingUploads =
             _prepareRendererResources->pendingGeometryUploads() > 0 ||
             _prepareRendererResources->pendingRasterUploads() > 0 ||
             _workerQueueLength > 0 ||
             _mainQueueLength > 0;
-        const bool replacementHasEnoughViewportContent =
-            drawablePrimitiveCount >= 128 &&
-            texturedPrimitiveCount >= static_cast<size_t>(
-                static_cast<double>(drawablePrimitiveCount) * 0.85);
-        const bool replacementIsMuchSmallerRenderSet =
-            _selectedDrawablePrimitiveCount > 0 &&
-            drawablePrimitiveCount > 0 &&
-            _selectedDrawablePrimitiveCount > drawablePrimitiveCount * 3;
-        const double acceptedCameraDistanceDegrees = angularDistanceDegrees(
-            _selectedCameraLongitudeDegrees,
-            _selectedCameraLatitudeDegrees,
-            camera.longitudeDegrees,
-            camera.latitudeDegrees);
-        const double viewportMoveThresholdDegrees = std::max(
-            0.02,
-            camera.altitudeMeters / 6'371'000.0 * 180.0 / kPi * 0.12);
-        const bool cameraMovedBeyondAcceptedCoverage =
-            _selectedDrawablePrimitiveCount > 0 &&
-            acceptedCameraDistanceDegrees > viewportMoveThresholdDegrees;
-        const bool replacementHasReadyTargetLod =
-            replacementHasDrawableContent &&
-            texturedPrimitiveCount > 0 &&
-            !replacementIsCoarserLod &&
-            drawablePrimitiveCount >= static_cast<size_t>(
-                static_cast<double>(std::max<size_t>(_selectedDrawablePrimitiveCount, 1)) * 0.90) &&
-            texturedPrimitiveCount >= static_cast<size_t>(
-                static_cast<double>(std::max<size_t>(_selectedTexturedPrimitiveCount, 1)) * 0.90);
-        const bool shouldKeepSharperCurrentSelection =
-            _selectedTexturedPrimitiveCount > 0 &&
-            replacementIsCoarserLod &&
-            !replacementExpandsCoverage &&
-            !cameraMovedBeyondAcceptedCoverage &&
-            !cameraZoomedOutSinceAcceptedSelection &&
-            (uploadBacklogActive || _framePressure > 0.35);
-        const int32_t maxPreservationFrames = uploadBacklogActive ? 24 : 8;
-        const bool preservesVisualContinuity =
-            !replacementHasReadyTargetLod &&
-            (!replacementExpandsCoverage || shouldKeepSharperCurrentSelection) &&
-            (!replacementHasEnoughViewportContent || shouldKeepSharperCurrentSelection) &&
-            (replacementIsTooSparse || replacementImageryIsTooSparse || replacementIsCoarserLod) &&
-            (uploadBacklogActive || _framePressure > 0.35) &&
-            _consecutiveSelectionPreservationFrames < maxPreservationFrames;
-        const bool acceptsSelection =
-            _selectedResources.empty() ||
-            (cameraMovedBeyondAcceptedCoverage && replacementHasDrawableContent) ||
-            (!shouldKeepSharperCurrentSelection && replacementHasReadyTargetLod) ||
-            (!shouldKeepSharperCurrentSelection && replacementExpandsCoverage && replacementHasDrawableContent) ||
-            (cameraZoomedOutSinceAcceptedSelection && replacementHasDrawableContent) ||
-            (!shouldKeepSharperCurrentSelection &&
-                replacementIsMuchSmallerRenderSet &&
-                replacementHasEnoughViewportContent &&
-                !replacementIsCoarserLod) ||
-            (!replacementIsCoarserLod && !uploadBacklogActive && replacementHasDrawableContent) ||
-            (!shouldKeepSharperCurrentSelection &&
-                !preservesVisualContinuity &&
-                replacementHasDrawableContent);
-
-        if (acceptsSelection) {
-            std::unordered_set<const GpuTileResources*> nextResourceSet;
-            nextResourceSet.reserve(nextSelectedResources.size());
-            for (const GpuTileResources* resources : nextSelectedResources) {
-                if (resources) nextResourceSet.insert(resources);
-            }
-            _continuityResources.clear();
-            _continuityResources.reserve(_selectedResources.size());
+        const bool shouldPreserveCurrentSelection =
+            hasCurrentTexturedSelection &&
+            candidateHasDrawableContent &&
+            !candidateRenderReadyComplete &&
+            (cameraMoving || candidateHasPendingUploads) &&
+            _consecutiveSelectionPreservationFrames < 90;
+        std::unordered_set<const GpuTileResources*> nextResourceSet;
+        nextResourceSet.reserve(nextSelectedResources.size());
+        for (const GpuTileResources* resources : nextSelectedResources) {
+            if (resources) nextResourceSet.insert(resources);
+        }
+        bool resourceSetChanged = nextResourceSet.size() != _selectedResources.size();
+        if (!resourceSetChanged) {
             for (const GpuTileResources* resources : _selectedResources) {
                 if (resources && nextResourceSet.find(resources) == nextResourceSet.end()) {
-                    _continuityResources.push_back(resources);
-                    if (_continuityResources.size() >= 160) {
-                        break;
-                    }
+                    resourceSetChanged = true;
+                    break;
                 }
             }
-            _continuityResourceFramesRemaining =
-                !_continuityResources.empty() &&
-                !replacementHasReadyTargetLod &&
-                (uploadBacklogActive || replacementImageryIsTooSparse)
-                    ? 6
-                    : 0;
-            if (_continuityResourceFramesRemaining == 0) {
-                _continuityResources.clear();
-            }
-            _selectedTiles = std::move(nextSelectedTiles);
-            _selectedResources = std::move(nextSelectedResources);
-            _selectedPrimitiveSet.clear();
-            for (const GpuTileResources* resources : _selectedResources) {
-                if (!resources) continue;
-                for (const GpuPrimitive& primitive : resources->primitives) {
-                    _selectedPrimitiveSet.insert(&primitive);
-                }
-            }
-            _selectedDrawablePrimitiveCount = countDrawablePrimitives(_selectedResources);
-            _selectedTexturedPrimitiveCount = countTexturedPrimitives(_selectedResources);
-            _selectedCameraAltitudeMeters = camera.altitudeMeters;
-            _selectedCameraLongitudeDegrees = camera.longitudeDegrees;
-            _selectedCameraLatitudeDegrees = camera.latitudeDegrees;
-            _selectedAverageTileLevel = candidateAverageLevel;
-            ++_selectionGeneration;
-            _consecutiveSelectionPreservationFrames = 0;
-        } else if (preservesVisualContinuity) {
-            ++_resourcePreservationFrames;
-            ++_consecutiveSelectionPreservationFrames;
         }
+
+        if (shouldPreserveCurrentSelection) {
+            ++_consecutiveSelectionPreservationFrames;
+            ++_resourcePreservationFrames;
+            _selectionSettled = false;
+            _stableSelectionFrames = 0;
+            if ((_frameUpdates % 60) == 0) {
+                __android_log_print(
+                    ANDROID_LOG_INFO,
+                    "CesiumBridge",
+                    "preserve selection candidateDrawable=%zu candidateTextured=%zu keptDrawable=%zu keptTextured=%zu streak=%d pendingGeometry=%zu pendingRaster=%zu workerQ=%d mainQ=%d",
+                    drawablePrimitiveCount,
+                    texturedPrimitiveCount,
+                    _selectedDrawablePrimitiveCount,
+                    _selectedTexturedPrimitiveCount,
+                    _consecutiveSelectionPreservationFrames,
+                    _prepareRendererResources->pendingGeometryUploads(),
+                    _prepareRendererResources->pendingRasterUploads(),
+                    _workerQueueLength,
+                    _mainQueueLength);
+            }
+            return true;
+        }
+
+        _selectedTiles = std::move(nextSelectedTiles);
+        _selectedResources = std::move(nextSelectedResources);
+        _continuityResources = std::move(nextFadingResources);
+        _fadeAlphaByResource = std::move(nextFadeAlphaByResource);
+        _selectedPrimitiveSet.clear();
+        for (const GpuTileResources* resources : _selectedResources) {
+            if (!resources) continue;
+            for (const GpuPrimitive& primitive : resources->primitives) {
+                _selectedPrimitiveSet.insert(&primitive);
+            }
+        }
+        _selectedDrawablePrimitiveCount = countDrawablePrimitives(_selectedResources);
+        _selectedTexturedPrimitiveCount = countRenderReadyTexturedPrimitives(_selectedResources);
+        _selectedCameraAltitudeMeters = camera.altitudeMeters;
+        _selectedCameraLongitudeDegrees = camera.longitudeDegrees;
+        _selectedCameraLatitudeDegrees = camera.latitudeDegrees;
+        _selectedAverageTileLevel = candidateAverageLevel;
+        if (resourceSetChanged) {
+            ++_selectionGeneration;
+        }
+        _consecutiveSelectionPreservationFrames = 0;
 	        updateSelectionSettledState(camera);
 	        if ((_frameUpdates % 60) == 0) {
             __android_log_print(
                 ANDROID_LOG_INFO,
                 "CesiumBridge",
-                "tiles render=%zu loaded=%d visited=%u culled=%u workerQ=%d mainQ=%d maxDepth=%u moving=%d pressure=%.2f",
+	                "tiles render=%zu fading=%zu fadingDrawn=%zu loaded=%d visited=%u culled=%u occluded=%u waitingOcclusion=%u workerQ=%d mainQ=%d maxDepth=%u moving=%d pressure=%.2f",
                 result.tilesToRenderThisFrame.size(),
+                result.tilesFadingOut.size(),
+                nextFadingResources.size(),
                 _tileset->getNumberOfTilesLoaded(),
                 result.tilesVisited,
                 result.tilesCulled,
+                result.tilesOccluded,
+                result.tilesWaitingForOcclusionResults,
                 result.workerThreadTileLoadQueueLength,
                 result.mainThreadTileLoadQueueLength,
                 result.maxDepthVisited,
@@ -1221,8 +1250,8 @@ private:
                     texturedPrimitiveCount,
                     _selectedDrawablePrimitiveCount,
                     _selectedTexturedPrimitiveCount,
-                    acceptsSelection ? 1 : 0,
-                    preservesVisualContinuity ? 1 : 0,
+                    shouldPreserveCurrentSelection ? 0 : 1,
+                    _continuityResources.empty() ? 0 : 1,
                     _consecutiveSelectionPreservationFrames,
                     _geometryUploadsThisFrame,
                     _rasterUploadsThisFrame,
@@ -1258,15 +1287,6 @@ private:
                 _mainQueueLength == 0 &&
                 _prepareRendererResources->pendingGeometryUploads() == 0 &&
                 _prepareRendererResources->pendingRasterUploads() == 0;
-            if (queuesEmpty && _continuityResourceFramesRemaining > 0) {
-                _continuityResources.clear();
-                _continuityResourceFramesRemaining = 0;
-            } else if (_continuityResourceFramesRemaining > 0) {
-                --_continuityResourceFramesRemaining;
-                if (_continuityResourceFramesRemaining == 0) {
-                    _continuityResources.clear();
-                }
-            }
 	        const bool enoughDetail = selectedResources >= minimumResources;
 	        const bool unchanged =
 	            currentLoadedTiles == _lastSettledLoadedTiles &&
@@ -1283,19 +1303,6 @@ private:
 	        _selectionSettled = _stableSelectionFrames >= 30;
 	    }
 
-    void freeTextureArrayBatch() {
-        for (TextureArrayBatch& batch : _textureAtlasBatches) {
-            if (batch.vertexBuffer != 0) glDeleteBuffers(1, &batch.vertexBuffer);
-            if (batch.indexBuffer != 0) glDeleteBuffers(1, &batch.indexBuffer);
-            if (batch.ownsTexture && batch.textureArray != 0) glDeleteTextures(1, &batch.textureArray);
-        }
-        _textureAtlasBatches.clear();
-        _batchedPrimitives.clear();
-        _batchTexturedPrimitiveCount = 0;
-        _atlasBatchBuildComplete = false;
-        _atlasBatchBuildCooldownFrames = 0;
-    }
-
     const OverlayVertexBuffer* findOverlayVertexBuffer(
         const GpuPrimitive& primitive,
         int32_t overlayTextureCoordinateID) const {
@@ -1307,169 +1314,6 @@ private:
         return nullptr;
     }
 
-    void rebuildTextureArrayBatchIfNeeded() {
-        const size_t currentTexturedPrimitiveCount = countTexturedPrimitives(_selectedResources);
-        if (_batchSelectionGeneration != _selectionGeneration ||
-            _batchTexturedPrimitiveCount != currentTexturedPrimitiveCount) {
-            _batchSelectionGeneration = _selectionGeneration;
-            _batchTexturedPrimitiveCount = currentTexturedPrimitiveCount;
-            _atlasBatchBuildComplete = false;
-            if (_textureAtlasBatches.size() > 128) {
-                freeTextureArrayBatch();
-            }
-        }
-        if (_atlasBatchBuildComplete) {
-            return;
-        }
-        if (_atlasBatchBuildCooldownFrames > 0) {
-            --_atlasBatchBuildCooldownFrames;
-            return;
-        }
-        const size_t pendingGeometryUploads = _prepareRendererResources->pendingGeometryUploads();
-        const size_t pendingRasterUploads = _prepareRendererResources->pendingRasterUploads();
-        const bool queuesBusy =
-            _workerQueueLength > 96 ||
-            _mainQueueLength > 96 ||
-            pendingGeometryUploads > 96 ||
-            pendingRasterUploads > 96;
-        if (pendingGeometryUploads > 0 || pendingRasterUploads > 0) {
-            return;
-        }
-        if (_workerQueueLength > 128 || _mainQueueLength > 128) {
-            return;
-        }
-        if (_drawMs > 32.0 || _gpuDrawMs > 24.0) {
-            return;
-        }
-        const bool frameHasAtlasBudget =
-            _drawMs <= 0.0 ||
-            _drawMs < 13.0 ||
-            (_drawMs < 25.0 && queuesBusy) ||
-            (_drawMs < 18.0 && !queuesBusy);
-        if (!frameHasAtlasBudget) {
-            return;
-        }
-
-        std::unordered_map<GLuint, std::vector<DrawCommand>> uploadAtlasGroups;
-        for (const GpuTileResources* resources : _selectedResources) {
-            if (!resources) continue;
-            for (const GpuPrimitive& primitive : resources->primitives) {
-                if (_batchedPrimitives.find(&primitive) != _batchedPrimitives.end()) continue;
-                if (primitive.cpuIndexData.empty()) continue;
-                for (const RasterAttachment& attachment : primitive.rasterAttachments) {
-                    const GpuTexture* texture = attachment.textureResource.get();
-                    if (!texture ||
-                        texture->id == 0 ||
-                        texture->width < 2048 ||
-                        texture->height < 2048) {
-                        continue;
-                    }
-                    const OverlayVertexBuffer* overlay =
-                        findOverlayVertexBuffer(primitive, attachment.overlayTextureCoordinateID);
-                    if (!overlay || overlay->cpuVertexData.empty()) continue;
-                    uploadAtlasGroups[texture->id].push_back(
-                        DrawCommand{&primitive, &attachment, 0, 0.0, false});
-                    break;
-                }
-            }
-        }
-
-        for (const auto& entry : uploadAtlasGroups) {
-            const GLuint texture = entry.first;
-            const std::vector<DrawCommand>& commands = entry.second;
-            if (commands.size() < 8) continue;
-            TextureArrayBatch batch;
-            batch.textureArray = texture;
-            batch.ownsTexture = false;
-            batch.originEcef = commands.front().primitive->originEcef;
-            std::vector<float> vertices;
-            std::vector<uint32_t> indices;
-            const size_t commandLimit = std::min<size_t>(
-                commands.size(),
-                _gpuDrawMs > 8.0 ? 8 :
-                _drawMs > 18.0 ? 16 :
-                _drawMs > 13.0 ? 24 :
-                _drawMs > 8.0 ? 32 :
-                queuesBusy ? 48 :
-                64);
-            vertices.reserve(commandLimit * 4 * 5);
-            indices.reserve(commandLimit * 6);
-            size_t builtPrimitives = 0;
-            for (size_t commandIndex = 0; commandIndex < commandLimit; ++commandIndex) {
-                const GpuPrimitive& primitive = *commands[commandIndex].primitive;
-                const RasterAttachment& attachment = *commands[commandIndex].attachment;
-                const OverlayVertexBuffer* overlay =
-                    findOverlayVertexBuffer(primitive, attachment.overlayTextureCoordinateID);
-                if (!overlay) continue;
-                const uint32_t baseVertex = static_cast<uint32_t>(vertices.size() / 5);
-                const glm::dvec3 offset = primitive.originEcef - batch.originEcef;
-                for (size_t i = 0; i + 4 < overlay->cpuVertexData.size(); i += 5) {
-                    const double u =
-                        static_cast<double>(overlay->cpuVertexData[i + 3]) * attachment.scale.x +
-                        attachment.translation.x;
-                    const double v =
-                        static_cast<double>(overlay->cpuVertexData[i + 4]) * attachment.scale.y +
-                        attachment.translation.y;
-                    vertices.push_back(static_cast<float>(static_cast<double>(overlay->cpuVertexData[i]) + offset.x));
-                    vertices.push_back(static_cast<float>(static_cast<double>(overlay->cpuVertexData[i + 1]) + offset.y));
-                    vertices.push_back(static_cast<float>(static_cast<double>(overlay->cpuVertexData[i + 2]) + offset.z));
-                    vertices.push_back(static_cast<float>(u));
-                    vertices.push_back(static_cast<float>(v));
-                }
-                for (uint32_t index : primitive.cpuIndexData) {
-                    indices.push_back(baseVertex + index);
-                }
-                _batchedPrimitives.insert(&primitive);
-                batch.primitives.push_back(&primitive);
-                ++builtPrimitives;
-            }
-            if (vertices.empty() || indices.empty()) continue;
-            glGenBuffers(1, &batch.vertexBuffer);
-            glBindBuffer(GL_ARRAY_BUFFER, batch.vertexBuffer);
-            glBufferData(
-                GL_ARRAY_BUFFER,
-                static_cast<GLsizeiptr>(vertices.size() * sizeof(float)),
-                vertices.data(),
-                GL_STATIC_DRAW);
-            glBindBuffer(GL_ARRAY_BUFFER, 0);
-            glGenBuffers(1, &batch.indexBuffer);
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, batch.indexBuffer);
-            glBufferData(
-                GL_ELEMENT_ARRAY_BUFFER,
-                static_cast<GLsizeiptr>(indices.size() * sizeof(uint32_t)),
-                indices.data(),
-                GL_STATIC_DRAW);
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-            batch.indexCount = static_cast<GLsizei>(indices.size());
-            batch.primitiveCount = builtPrimitives;
-            batch.valid = true;
-            _textureAtlasBatches.push_back(batch);
-            _atlasBatchBuildCooldownFrames =
-                _drawMs > 18.0 ? 4 :
-                _drawMs > 13.0 ? 3 :
-                _drawMs > 8.0 ? 2 :
-                queuesBusy ? 2 :
-                1;
-            if ((_frameUpdates % 120) == 0) {
-                __android_log_print(
-                    ANDROID_LOG_INFO,
-                    "CesiumBridge",
-                    "atlas batch built texture=%u primitives=%zu/%zu batches=%zu drawMs=%.2f queues worker=%d main=%d pendingGeometry=%zu pendingRaster=%zu",
-                    texture,
-                    builtPrimitives,
-                    commands.size(),
-                    _textureAtlasBatches.size(),
-                    _drawMs,
-                    _workerQueueLength,
-                    _mainQueueLength,
-                    pendingGeometryUploads,
-                    pendingRasterUploads);
-            }
-            return;
-        }
-        _atlasBatchBuildComplete = true;
-    }
-
 	    void drawSelectedTiles(const CameraState& camera) {
 	        if (_program == 0) return;
 	
@@ -1478,8 +1322,8 @@ private:
 	        const glm::dvec3 backward = -frame.direction;
 
 	        const float aspect = static_cast<float>(_width) / static_cast<float>(_height);
-	        const float verticalFov = static_cast<float>(kPi / 3.0);
-            const double nearMeters = clampDouble(height * 0.005, 2.0, 50'000.0);
+	        const float verticalFov = static_cast<float>(CesiumUtility::Math::OnePi / 3.0);
+            const double nearMeters = std::clamp(height * 0.005, 2.0, 50'000.0);
             const double farMeters = std::max(
                 100'000.0,
                 std::min(height + 13'000'000.0, horizonDistanceMeters(height) + 750'000.0));
@@ -1487,57 +1331,7 @@ private:
 	        const float farPlane = static_cast<float>(std::max(farMeters, nearMeters + 10'000.0));
 	        const glm::mat4 projection = glm::perspective(verticalFov, aspect, nearPlane, farPlane);
 
-            rebuildTextureArrayBatchIfNeeded();
-
             DrawStats drawStats;
-            std::unordered_set<const GpuPrimitive*> activeBatchedPrimitives;
-            for (const TextureArrayBatch& batch : _textureAtlasBatches) {
-                if (!batch.valid) continue;
-                bool batchStillSelected = !batch.primitives.empty();
-                for (const GpuPrimitive* primitive : batch.primitives) {
-                    if (_selectedPrimitiveSet.find(primitive) == _selectedPrimitiveSet.end()) {
-                        batchStillSelected = false;
-                        break;
-                    }
-                }
-                if (!batchStillSelected) continue;
-                for (const GpuPrimitive* primitive : batch.primitives) {
-                    activeBatchedPrimitives.insert(primitive);
-                }
-                glUseProgram(_program);
-                const glm::dvec3 originEye = batch.originEcef - frame.eye;
-                glUniformMatrix4fv(_locations.projection, 1, GL_FALSE, &projection[0][0]);
-                glUniform3f(
-                    _locations.originEye,
-                    static_cast<float>(originEye.x),
-                    static_cast<float>(originEye.y),
-                    static_cast<float>(originEye.z));
-                glUniform3f(_locations.right, static_cast<float>(frame.right.x), static_cast<float>(frame.right.y), static_cast<float>(frame.right.z));
-                glUniform3f(_locations.up, static_cast<float>(frame.up.x), static_cast<float>(frame.up.y), static_cast<float>(frame.up.z));
-                glUniform3f(_locations.backward, static_cast<float>(backward.x), static_cast<float>(backward.y), static_cast<float>(backward.z));
-                glUniform1i(_locations.texture, 0);
-                glUniform1i(_locations.discardOutsideUv, 1);
-                glUniform2f(_locations.uvTranslation, 0.0f, 0.0f);
-                glUniform2f(_locations.uvScale, 1.0f, 1.0f);
-                glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, batch.textureArray);
-                glBindBuffer(GL_ARRAY_BUFFER, batch.vertexBuffer);
-                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, batch.indexBuffer);
-                glEnableVertexAttribArray(0);
-                glEnableVertexAttribArray(1);
-                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), nullptr);
-                glVertexAttribPointer(
-                    1,
-                    2,
-                    GL_FLOAT,
-                    GL_FALSE,
-                    5 * sizeof(float),
-                    reinterpret_cast<const void*>(3 * sizeof(float)));
-                glDrawElements(GL_TRIANGLES, batch.indexCount, GL_UNSIGNED_INT, nullptr);
-                ++drawStats.drawCalls;
-                drawStats.primitives += batch.primitiveCount;
-                glBindTexture(GL_TEXTURE_2D, 0);
-            }
 		
 	        glUseProgram(_program);
             glEnable(GL_POLYGON_OFFSET_FILL);
@@ -1547,23 +1341,30 @@ private:
 	        glUniform3f(_locations.up, static_cast<float>(frame.up.x), static_cast<float>(frame.up.y), static_cast<float>(frame.up.z));
 	        glUniform3f(_locations.backward, static_cast<float>(backward.x), static_cast<float>(backward.y), static_cast<float>(backward.z));
 	        glUniform1i(_locations.texture, 0);
+            glUniform1f(_locations.alpha, 1.0f);
 	        glEnableVertexAttribArray(0);
 	        glEnableVertexAttribArray(1);
         GLuint boundTexture = 0;
         const size_t drawCallBudget = 0;
-        std::vector<DrawCommand> drawCommands;
-        drawCommands.reserve((_selectedResources.size() + _continuityResources.size()) * 2);
+        std::vector<DrawCommand>& drawCommands = _drawCommandsScratch;
+        drawCommands.clear();
+        const size_t expectedDrawCommands =
+            (_selectedResources.size() + _continuityResources.size()) * 2;
+        if (drawCommands.capacity() < expectedDrawCommands) {
+            drawCommands.reserve(expectedDrawCommands);
+        }
         const bool hasContinuityBackdrop = !_continuityResources.empty();
 
         auto appendDrawCommands = [&](const std::vector<const GpuTileResources*>& resourcesList, bool continuity) {
 	        for (const GpuTileResources* resources : resourcesList) {
 	            if (!resources) continue;
+                float alpha = 1.0f;
+                alpha = alphaForResources(resources);
+                if (alpha <= 0.001f) continue;
 	            for (const GpuPrimitive& primitive : resources->primitives) {
-                if (!continuity && activeBatchedPrimitives.find(&primitive) != activeBatchedPrimitives.end()) {
-                    continue;
-                }
                 ++drawStats.primitives;
 	                if (primitive.vertexBuffer == 0 || primitive.indexBuffer == 0) {
+                        ++drawStats.primitivesMissingGeometry;
 	                    continue;
 	                }
                 bool pushedTexturedCommand = false;
@@ -1571,6 +1372,7 @@ private:
                     drawStats.attachments += primitive.rasterAttachments.size();
 	                    for (const RasterAttachment& attachment : primitive.rasterAttachments) {
 	                        if (!attachment.textureResource || attachment.textureResource->id == 0) {
+                                ++drawStats.primitivesMissingRaster;
 	                            continue;
 	                        }
 	                        GLuint vertexBuffer = 0;
@@ -1589,9 +1391,11 @@ private:
                             DrawCommand{
                                 &primitive,
                                 &attachment,
+                                resources,
                                 vertexBuffer,
                                 glm::dot(primitiveToEye, primitiveToEye),
-                                continuity});
+                                continuity,
+                                alpha});
                         pushedTexturedCommand = true;
 	                    }
 	                }
@@ -1603,9 +1407,16 @@ private:
                             DrawCommand{
                                 &primitive,
                                 nullptr,
+                                resources,
                                 primitive.vertexBuffer,
                                 glm::dot(primitiveToEye, primitiveToEye),
-                                continuity});
+                                continuity,
+                                alpha});
+                    } else if (!pushedTexturedCommand) {
+                        ++drawStats.primitivesSkippedWithoutReadyRaster;
+                        if (!continuity && hasContinuityBackdrop) {
+                            ++drawStats.primitivesSkippedForContinuityBackdrop;
+                        }
                     }
 	            }
 	        }
@@ -1614,17 +1425,17 @@ private:
         appendDrawCommands(_continuityResources, true);
         appendDrawCommands(_selectedResources, false);
 
-        std::sort(
-            drawCommands.begin(),
-            drawCommands.end(),
-            [](const DrawCommand& a, const DrawCommand& b) {
+	        std::sort(
+	            drawCommands.begin(),
+	            drawCommands.end(),
+	            [](const DrawCommand& a, const DrawCommand& b) {
                 if (a.continuity != b.continuity) return a.continuity;
                 if (a.distanceSq != b.distanceSq) return a.distanceSq < b.distanceSq;
                 if (a.attachment == nullptr || b.attachment == nullptr) {
                     return a.attachment != nullptr;
                 }
-                return a.attachment->textureResource->id < b.attachment->textureResource->id;
-            });
+	                return a.attachment->textureResource->id < b.attachment->textureResource->id;
+	            });
 
         glActiveTexture(GL_TEXTURE0);
         GLuint boundVertexBuffer = 0;
@@ -1663,10 +1474,10 @@ private:
                     reinterpret_cast<const void*>(3 * sizeof(float)));
                 boundVertexBuffer = command.vertexBuffer;
             }
-            const GLuint texture = command.attachment && command.attachment->textureResource
-                ? command.attachment->textureResource->id
-                : _fallbackTexture;
-            if (command.attachment) {
+            glUniform1f(_locations.alpha, command.alpha);
+            GLuint texture = _fallbackTexture;
+            if (command.attachment && command.attachment->textureResource) {
+                texture = command.attachment->textureResource->id;
                 glUniform1i(_locations.discardOutsideUv, 1);
                 glUniform2f(
                     _locations.uvTranslation,
@@ -1680,14 +1491,14 @@ private:
                 glUniform1i(_locations.discardOutsideUv, 0);
                 glUniform2f(_locations.uvTranslation, 0.0f, 0.0f);
                 glUniform2f(_locations.uvScale, 1.0f, 1.0f);
-            }
-            if (boundTexture != texture) {
-                glBindTexture(GL_TEXTURE_2D, texture);
-                boundTexture = texture;
-            }
-            glDrawElements(GL_TRIANGLES, primitive.indexCount, primitive.indexType, nullptr);
-            ++drawStats.drawCalls;
-        }
+	            }
+	            if (boundTexture != texture) {
+	                glBindTexture(GL_TEXTURE_2D, texture);
+	                boundTexture = texture;
+	            }
+	            glDrawElements(GL_TRIANGLES, primitive.indexCount, primitive.indexType, nullptr);
+	            ++drawStats.drawCalls;
+	        }
         if (!depthMaskEnabled) {
             glDepthMask(GL_TRUE);
         }
@@ -1702,12 +1513,16 @@ private:
             __android_log_print(
                 ANDROID_LOG_INFO,
                 "CesiumBridge",
-                "draw primitives=%zu attachments=%zu drawCalls=%zu skippedByBudget=%zu missingOverlayStreams=%zu",
+                "draw primitives=%zu attachments=%zu drawCalls=%zu skippedByBudget=%zu missingOverlayStreams=%zu missingGeometry=%zu missingRaster=%zu skippedWithoutReadyRaster=%zu skippedForBackdrop=%zu",
                 drawStats.primitives,
                 drawStats.attachments,
                 drawStats.drawCalls,
                 drawStats.skippedByBudget,
-                drawStats.missingOverlayStreams);
+                drawStats.missingOverlayStreams,
+                drawStats.primitivesMissingGeometry,
+                drawStats.primitivesMissingRaster,
+                drawStats.primitivesSkippedWithoutReadyRaster,
+                drawStats.primitivesSkippedForContinuityBackdrop);
             __android_log_print(
                 ANDROID_LOG_INFO,
                 "CesiumBridge",
@@ -1724,6 +1539,7 @@ private:
     std::shared_ptr<BackgroundTaskProcessor> _taskProcessor;
     std::shared_ptr<MinimalPrepareRendererResources> _prepareRendererResources;
     std::shared_ptr<CesiumAsync::IAssetAccessor> _assetAccessor;
+    std::shared_ptr<CesiumUtility::CreditSystem> _creditSystem;
     Cesium3DTilesSelection::TilesetExternals _externals;
     std::unique_ptr<Cesium3DTilesSelection::Tileset> _tileset;
     CameraState _camera;
@@ -1731,6 +1547,7 @@ private:
 	    std::vector<SelectedTile> _selectedTiles;
 	    std::vector<const GpuTileResources*> _selectedResources;
         std::vector<const GpuTileResources*> _continuityResources;
+        std::unordered_map<const GpuTileResources*, float> _fadeAlphaByResource;
         std::vector<const GpuTileResources*> _uploadPriorityResources;
         size_t _selectedDrawablePrimitiveCount = 0;
         size_t _selectedTexturedPrimitiveCount = 0;
@@ -1739,24 +1556,17 @@ private:
         double _selectedCameraLatitudeDegrees = 0.0;
         double _selectedAverageTileLevel = 0.0;
 	    GLuint _program = 0;
-        GLuint _textureArrayProgram = 0;
         GLuint _fallbackTexture = 0;
 	    ProgramLocations _locations;
-        ProgramLocations _textureArrayLocations;
-        std::vector<TextureArrayBatch> _textureAtlasBatches;
-        std::unordered_set<const GpuPrimitive*> _batchedPrimitives;
         std::unordered_set<const GpuPrimitive*> _selectedPrimitiveSet;
+        std::vector<DrawCommand> _drawCommandsScratch;
         uint64_t _selectionGeneration = 1;
-        uint64_t _batchSelectionGeneration = 0;
-        size_t _batchTexturedPrimitiveCount = 0;
-        bool _atlasBatchBuildComplete = false;
-        int32_t _atlasBatchBuildCooldownFrames = 0;
 	    int _width = 1;
 	    int _height = 1;
     uint32_t _tilesVisited = 0;
-    int32_t _workerQueueLength = 0;
-    int32_t _mainQueueLength = 0;
-    jlong _cameraUpdates = 0;
+	    int32_t _workerQueueLength = 0;
+	    int32_t _mainQueueLength = 0;
+	    jlong _cameraUpdates = 0;
     jlong _memoryClears = 0;
     jlong _frameUpdates = 0;
     jlong _lastCameraUpdateFrame = 0;
@@ -1769,7 +1579,6 @@ private:
         int32_t _stableSelectionFrames = 0;
         int32_t _framesSinceLastMainThreadDispatch = 0;
         int32_t _consecutiveSelectionPreservationFrames = 0;
-        int32_t _continuityResourceFramesRemaining = 0;
         bool _mainThreadDispatchSkipped = false;
         bool _loadTilesSkipped = false;
         int64_t _resourcePreservationFrames = 0;
@@ -1980,7 +1789,26 @@ Java_com_example_cesiumpoc_cesium_1native_1android_1poc_NativeCesiumBridge_nativ
     jint height,
     jdouble deltaSeconds) {
     if (auto* bridge = fromHandle(handle)) {
-        bridge->renderFrame(width, height, deltaSeconds);
+        try {
+            bridge->renderFrame(width, height, deltaSeconds);
+        } catch (const std::bad_alloc&) {
+            __android_log_print(
+                ANDROID_LOG_ERROR,
+                "CesiumBridge",
+                "renderFrame failed: out of memory; clearing renderer caches");
+            bridge->clearMemory();
+        } catch (const std::exception& e) {
+            __android_log_print(
+                ANDROID_LOG_ERROR,
+                "CesiumBridge",
+                "renderFrame failed: %s",
+                e.what());
+        } catch (...) {
+            __android_log_print(
+                ANDROID_LOG_ERROR,
+                "CesiumBridge",
+                "renderFrame failed: unknown native exception");
+        }
     }
 }
 
@@ -2013,15 +1841,18 @@ Java_com_example_cesiumpoc_cesium_1native_1android_1poc_NativeCesiumBridge_nativ
     jlong handle,
     jstring urlTemplate) {
     if (auto* bridge = fromHandle(handle)) {
-        std::string templateValue;
-        if (urlTemplate != nullptr) {
-            const char* chars = env->GetStringUTFChars(urlTemplate, nullptr);
-            if (chars != nullptr) {
-                templateValue = chars;
-                env->ReleaseStringUTFChars(urlTemplate, chars);
-            }
-        }
-        bridge->setImageryUrlTemplate(templateValue);
+        bridge->setImageryUrlTemplate(jstringToStdString(env, urlTemplate));
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_cesiumpoc_cesium_1native_1android_1poc_NativeCesiumBridge_nativeSetTerrainLayerJsonUrl(
+    JNIEnv* env,
+    jobject,
+    jlong handle,
+    jstring url) {
+    if (auto* bridge = fromHandle(handle)) {
+        bridge->setTerrainLayerJsonUrl(jstringToStdString(env, url));
     }
 }
 

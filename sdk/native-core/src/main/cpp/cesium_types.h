@@ -12,15 +12,13 @@
 
 namespace cesium_poc {
 
-constexpr double kPi = 3.14159265358979323846264338327950288;
-
 struct CameraState {
     double longitudeDegrees = 104.0;
     double latitudeDegrees = 35.0;
     double altitudeMeters = 3535534.0;
     bool autoOrbit = false;
     double bearingDegrees = 0.0;
-    double pitchDegrees = 35.0;
+    double pitchDegrees = 0.0;
 };
 
 struct EcefPosition {
@@ -99,6 +97,7 @@ struct ProgramLocations {
     GLint uvTranslation = -1;
     GLint uvScale = -1;
     GLint discardOutsideUv = -1;
+    GLint alpha = -1;
 };
 
 } // namespace cesium_poc

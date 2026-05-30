@@ -5,6 +5,7 @@ import 'cesium_gesture_options.dart';
 import 'cesium_performance_options.dart';
 import 'cesium_render_stats.dart';
 import 'imagery_source.dart';
+import 'terrain_source.dart';
 
 abstract class CesiumMapController {
   Future<void> setCamera(CesiumCameraState camera);
@@ -26,6 +27,10 @@ abstract class CesiumMapController {
   Future<ImagerySource?> getImagerySource();
 
   Future<void> setImagerySource(ImagerySource? source);
+
+  Future<TerrainSource?> getTerrainSource();
+
+  Future<void> setTerrainSource(TerrainSource? source);
 
   Future<void> clearMemory();
 
@@ -101,6 +106,18 @@ class MethodChannelCesiumMapController implements CesiumMapController {
   @override
   Future<void> setImagerySource(ImagerySource? source) async {
     await channel.invokeMethod<void>('setImagerySource', source?.toMap());
+  }
+
+  @override
+  Future<TerrainSource?> getTerrainSource() async {
+    final data =
+        await channel.invokeMethod<Map<Object?, Object?>>('getTerrainSource');
+    return TerrainSource.fromMap(data);
+  }
+
+  @override
+  Future<void> setTerrainSource(TerrainSource? source) async {
+    await channel.invokeMethod<void>('setTerrainSource', source?.toMap());
   }
 
   @override

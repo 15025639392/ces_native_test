@@ -18,6 +18,7 @@ class CesiumMapView(
     private val renderSurface = CesiumMapRenderSurface(context)
     private var listener: CesiumMapListener? = null
     private var currentImagerySource: ImagerySource? = null
+    private var currentTerrainSource: TerrainSource? = null
 
     internal var onMapReady: (() -> Unit)?
         get() = null
@@ -91,6 +92,13 @@ class CesiumMapView(
         set(value) {
             currentImagerySource = value
             renderSurface.imagerySource = value
+        }
+
+    override var terrainSource: TerrainSource?
+        get() = currentTerrainSource
+        set(value) {
+            currentTerrainSource = value
+            renderSurface.terrainSource = value
         }
 
     init {

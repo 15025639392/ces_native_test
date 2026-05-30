@@ -8,6 +8,8 @@ import com.example.cesiumpoc.cesium_native_android_poc.CesiumMapView
 import com.example.cesiumpoc.cesium_native_android_poc.CesiumPerformanceOptions
 import com.example.cesiumpoc.cesium_native_android_poc.CesiumRenderStats
 import com.example.cesiumpoc.cesium_native_android_poc.ImagerySource
+import com.example.cesiumpoc.cesium_native_android_poc.QuantizedMeshTerrainSource
+import com.example.cesiumpoc.cesium_native_android_poc.TerrainSource
 import com.example.cesiumpoc.cesium_native_android_poc.UrlTemplateImagerySource
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
@@ -40,6 +42,7 @@ internal class CesiumMapPlatformView(
         mapView.gestureOptions = params.toGestureOptions()
         mapView.performanceOptions = params.toPerformanceOptions()
         mapView.imagerySource = params.toImagerySource()
+        mapView.terrainSource = params.toTerrainSource()
         mapView.onStats = { channel.invokeMethod("stats", it.toMap()) }
         mapView.onMapReady = { channel.invokeMethod("mapReady", null) }
         mapView.onCameraMoveStarted = { channel.invokeMethod("cameraMoveStarted", it.toMap()) }
@@ -97,6 +100,9 @@ internal class CesiumMapPlatformView(
                 "getImagerySource" -> {
                     result.success(mapView.imagerySource?.toMap())
                 }
+                "getTerrainSource" -> {
+                    result.success(mapView.terrainSource?.toMap())
+                }
                 "clearMemory" -> {
                     mapView.clearMemory()
                     result.success(null)
@@ -118,6 +124,11 @@ internal class CesiumMapPlatformView(
                 "setImagerySource" -> {
                     val args = call.arguments as? Map<*, *>
                     mapView.imagerySource = args?.toImagerySource()
+                    result.success(null)
+                }
+                "setTerrainSource" -> {
+                    val args = call.arguments as? Map<*, *>
+                    mapView.terrainSource = args?.toTerrainSource()
                     result.success(null)
                 }
                 "getStats" -> {
@@ -148,7 +159,7 @@ private fun Map<*, *>.toGestureOptions(): CesiumGestureOptions {
     return CesiumGestureOptions(
         panEnabled = boolValue("panEnabled", true),
         zoomEnabled = boolValue("zoomEnabled", true),
-        rotateEnabled = boolValue("rotateEnabled", false),
+        rotateEnabled = boolValue("rotateEnabled", true),
         tiltEnabled = boolValue("tiltEnabled", true),
         inertiaEnabled = boolValue("inertiaEnabled", true),
     )
@@ -157,12 +168,6 @@ private fun Map<*, *>.toGestureOptions(): CesiumGestureOptions {
 private fun Map<*, *>.toPerformanceOptions(): CesiumPerformanceOptions {
     return CesiumPerformanceOptions(
         maximumScreenSpaceError = doubleValue("maximumScreenSpaceError", 4.0),
-        movementMaximumScreenSpaceError =
-            if (containsKey("movementMaximumScreenSpaceError")) {
-                (this["movementMaximumScreenSpaceError"] as? Number)?.toDouble()
-            } else {
-                8.0
-            },
     )
 }
 
@@ -171,6 +176,16 @@ private fun Map<*, *>.toImagerySource(): ImagerySource? {
         "urlTemplate" -> UrlTemplateImagerySource(
             id = this["id"] as? String ?: "",
             urlTemplate = this["urlTemplate"] as? String ?: "",
+        )
+        else -> null
+    }
+}
+
+private fun Map<*, *>.toTerrainSource(): TerrainSource? {
+    return when (this["terrainType"] as? String ?: this["type"] as? String) {
+        "quantizedMesh" -> QuantizedMeshTerrainSource(
+            id = this["terrainId"] as? String ?: this["id"] as? String ?: "",
+            layerJsonUrl = this["layerJsonUrl"] as? String ?: "",
         )
         else -> null
     }
@@ -200,9 +215,6 @@ private fun CesiumGestureOptions.toMap(): Map<String, Any> {
 private fun CesiumPerformanceOptions.toMap(): Map<String, Any> {
     return buildMap {
         put("maximumScreenSpaceError", maximumScreenSpaceError)
-        movementMaximumScreenSpaceError?.let {
-            put("movementMaximumScreenSpaceError", it)
-        }
     }
 }
 
@@ -212,6 +224,16 @@ private fun ImagerySource.toMap(): Map<String, Any?> {
             "type" to "urlTemplate",
             "id" to id,
             "urlTemplate" to urlTemplate,
+        )
+    }
+}
+
+private fun TerrainSource.toMap(): Map<String, Any?> {
+    return when (this) {
+        is QuantizedMeshTerrainSource -> mapOf(
+            "type" to "quantizedMesh",
+            "id" to id,
+            "layerJsonUrl" to layerJsonUrl,
         )
     }
 }

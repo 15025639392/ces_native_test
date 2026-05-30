@@ -20,6 +20,7 @@ class CesiumMapFragment : Fragment() {
     private var pendingGestureOptions: CesiumGestureOptions = CesiumGestureOptions()
     private var pendingPerformanceOptions: CesiumPerformanceOptions = CesiumPerformanceOptions()
     private var pendingImagerySource: ImagerySource? = null
+    private var pendingTerrainSource: TerrainSource? = null
     val controller: CesiumMapController = CesiumMapFragmentController(this)
 
     val cameraState: CesiumCameraState?
@@ -32,6 +33,8 @@ class CesiumMapFragment : Fragment() {
         get() = mapView?.performanceOptions ?: pendingPerformanceOptions
     val imagerySource: ImagerySource?
         get() = mapView?.imagerySource ?: pendingImagerySource
+    val terrainSource: TerrainSource?
+        get() = mapView?.terrainSource ?: pendingTerrainSource
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -51,6 +54,7 @@ class CesiumMapFragment : Fragment() {
         view.gestureOptions = pendingGestureOptions
         view.performanceOptions = pendingPerformanceOptions
         view.imagerySource = pendingImagerySource
+        view.terrainSource = pendingTerrainSource
         pendingCamera?.let(view::setCamera)
         return view
     }
@@ -114,6 +118,11 @@ class CesiumMapFragment : Fragment() {
     fun setImagerySource(source: ImagerySource?) {
         pendingImagerySource = source
         mapView?.imagerySource = source
+    }
+
+    fun setTerrainSource(source: TerrainSource?) {
+        pendingTerrainSource = source
+        mapView?.terrainSource = source
     }
 
     fun clearMemory() {

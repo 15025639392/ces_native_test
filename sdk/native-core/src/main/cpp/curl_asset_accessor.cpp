@@ -103,12 +103,22 @@ std::shared_ptr<CesiumAsync::IAssetRequest> performCurlRequest(
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 8000L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 20000L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeBody);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "cesium-native-android-poc/0.1");
     curl_easy_setopt(curl, CURLOPT_CAPATH, "/system/etc/security/cacerts");
+    if (url.find("https://3d.geo.admin.ch/") == 0 ||
+        url.find("https://tile.openstreetmap.org/") == 0) {
+        __android_log_print(
+            ANDROID_LOG_WARN,
+            "CesiumBridge",
+            "using demo TLS verification bypass for %s",
+            url.c_str());
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
     if (requestHeaders) {
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, requestHeaders);
     }
@@ -142,6 +152,14 @@ std::shared_ptr<CesiumAsync::IAssetRequest> performCurlRequest(
             curl_easy_strerror(result));
         body.clear();
         responseCode = 0;
+    } else {
+        __android_log_print(
+            ANDROID_LOG_INFO,
+            "CesiumBridge",
+            "curl request ok status=%ld bytes=%zu url=%s",
+            responseCode,
+            body.size(),
+            url.c_str());
     }
     CesiumAsync::HttpHeaders responseHeaders;
     return std::make_shared<CurlAssetRequest>(

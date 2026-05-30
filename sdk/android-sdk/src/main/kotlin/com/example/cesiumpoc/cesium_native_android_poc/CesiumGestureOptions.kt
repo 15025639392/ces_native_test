@@ -9,7 +9,7 @@ package com.example.cesiumpoc.cesium_native_android_poc
 data class CesiumGestureOptions(
     val panEnabled: Boolean = true,
     val zoomEnabled: Boolean = true,
-    val rotateEnabled: Boolean = false,
+    val rotateEnabled: Boolean = true,
     val tiltEnabled: Boolean = true,
     val inertiaEnabled: Boolean = true,
 )

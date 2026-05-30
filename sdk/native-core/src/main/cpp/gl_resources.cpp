@@ -34,18 +34,11 @@ GLuint createProgram() {
     constexpr const char* fragmentShader = R"(
         precision highp float;
         uniform sampler2D u_texture;
-        uniform bool u_discardOutsideUv;
+        uniform float u_alpha;
         varying vec2 v_texcoord;
         void main() {
-            const float edgeEpsilon = 0.00002;
-            if (u_discardOutsideUv &&
-                (v_texcoord.x < -edgeEpsilon ||
-                 v_texcoord.x > 1.0 + edgeEpsilon ||
-                 v_texcoord.y < -edgeEpsilon ||
-                 v_texcoord.y > 1.0 + edgeEpsilon)) {
-                discard;
-            }
-            gl_FragColor = texture2D(u_texture, clamp(v_texcoord, 0.0, 1.0));
+            vec4 color = texture2D(u_texture, clamp(v_texcoord, 0.0, 1.0));
+            gl_FragColor = vec4(color.rgb, color.a * u_alpha);
         }
     )";
 

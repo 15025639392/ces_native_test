@@ -10,6 +10,7 @@ add_library(
         gl_resources.cpp
         imagery_source_config.cpp
         prepare_renderer_resources.cpp
+        terrain_source_config.cpp
 )
 
 target_compile_features(cesium_bridge PRIVATE cxx_std_17)
@@ -64,6 +65,8 @@ target_link_libraries(
         ${gles_lib}
         CURL::libcurl
         CesiumGeospatial
+        CesiumGltfContent
         Cesium3DTilesSelection
+        CesiumQuantizedMeshTerrain
         CesiumRasterOverlays
 )
